@@ -80,7 +80,9 @@ def main():
 
         hu = CNHubert(os.path.join(gsv, "pretrained_models/chinese-hubert-base")).eval()
         w16 = resample_audio_tensor(raw, raw_sr, 16000).flatten().numpy()
-        ph16 = np.concatenate([w16, np.zeros(int(16000 * 0.3), dtype=np.float32)])
+        # repo (inference_webui.py) 的尾巴用的是 **目标采样率** * 0.3 个零点，再拼到 16 kHz 波形上
+        # —— v2 的 sampling_rate=32000，所以是 9600 点 = 16 kHz 下的 0.6 s。gsv_engine 照此实现。
+        ph16 = np.concatenate([w16, np.zeros(int(32000 * 0.3), dtype=np.float32)])
         with torch.no_grad():
             out = hu.model(torch.from_numpy(ph16).float().unsqueeze(0))["last_hidden_state"]
         ssl = out[0].transpose(0, 1).contiguous()                                        # [768,T]

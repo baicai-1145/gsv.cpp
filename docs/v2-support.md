@@ -108,8 +108,9 @@ eng->synthesize(sem, phones, prompt_codes, prompt_phones, ge, mel2, mel2_T,
 | --- | --- | --- |
 | AR | `gsv-ar-q8.gguf` | `gsv-ar-v2-q8.gguf`（同一套 `--kind ar`） |
 | S2 | cond + DiT + vocoder 三个文件 | `gsv-v2sovits.gguf` 一个文件 |
-| HuBERT | 教师 | 教师**或**蒸馏（`GSV_HUBERT_FRONTEND=distilled`） |
-| BERT | 必需 | 必需（enc_p 的 text_embedding 输入） |
+| HuBERT | 教师 | 教师**或**蒸馏（`GSV_HUBERT_FRONTEND=distilled` / `--hubert gsv-dhubert.gguf`）；
+  用蒸馏时**不需要**教师 GGUF |
+| BERT | 必需 | 只用于 AR（文本 → bert 特征）；S2 的 enc_p 只吃音素 id，不需要 bert |
 | ref_enc | 在 cond 文件里 | 在 v2sovits 文件里 |
 
 ## 对拍
@@ -117,9 +118,7 @@ eng->synthesize(sem, phones, prompt_codes, prompt_phones, ge, mel2, mel2_T,
 `tests/probe_v2sovits.cpp` 逐段比较 torch 与本实现的中间张量（`tests/v2_dump_reference.py`
 产出 fixture，同一份 ssl/spec704 两侧共用，因此比较与重采样实现无关）。
 
-见下表（4 vCPU EPYC 7K62，单线程/4 线程 CPU，参考音频 4.2 s）。
-
-fixture：`ref.wav` → 4.12 s @ 32 kHz，103 codes → 206 帧（`/tmp/v2fix`，由 `tests/v2_dump_reference.py` 生成）。
+设备：4 vCPU EPYC 7K62，CPU 后端，4 线程。fixture：`ref.wav` → 4.12 s @ 32 kHz，103 codes → 206 帧（`/tmp/v2fix`，由 `tests/v2_dump_reference.py` 生成）。
 命令：`probe_v2sovits gsv-v2sovits.gguf /tmp/v2fix --threads 4`。
 
 | 阶段 | 张量 | 元素数 | max_abs | rms_diff | 参考 rms | cos | 判定 |
@@ -167,6 +166,12 @@ enc_p 96.3 ms、flow 45.6 ms、dec 862.1 ms。
 
 ## 已知差异
 
+- **参考音频的零尾长度**：上游 `inference_webui.py` 是 `np.zeros(int(hps.data.sampling_rate * 0.3))`
+  再拼到 **16 kHz** 波形上，v2 的 `sampling_rate=32000` ⇒ 9600 点（16 kHz 下 0.6 s）。
+  `gsv_engine::prep_reference` 按上游实现（9600），所以同一条 3.84 s 参考音频得到 110 个 prompt code；
+  本文对拍用的 `/tmp/v2fix` fixture 早期用的是 16 kHz 下的 0.3 s（4800 点），因此是 103 个。
+  这只影响 prompt code 的**数量**，不影响任何阶段的逐元素比较（各阶段都是长度自适应的）。
+  `tests/v2_dump_reference.py` 已改成上游口径。
 - **重采样**：torch 侧（GPT-SoVITS-CPUFast）用 PyAV/FFmpeg 重采样，本工程的 `prep_reference`
   用 resampy kaiser_best 的复刻（与上游 torch 一致）。只有参考音频的重采样这一步受影响，
   对拍时两侧共用同一份 ssl/spec704，所以不影响数值结论。
