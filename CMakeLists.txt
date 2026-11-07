@@ -67,6 +67,7 @@ file(GLOB GSV_ENGINE_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_encp.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_engine.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_hubert.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_kernels.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_mel.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_refcode.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_refenc.cpp"
@@ -149,6 +150,11 @@ if(GSV_BUILD_TESTS)
     target_include_directories(test_conv_direct_act PRIVATE ${GSV_GGML_INCLUDES})
     target_link_libraries(test_conv_direct_act PRIVATE ${GSV_GGML_LIBS})
     add_test(NAME test_conv_direct_act COMMAND test_conv_direct_act --cpu)
+
+    # dec ResBlock1 手写 AVX2 内核的正确性自检（对参考实现 + 线程数不变性，不计时）
+    add_executable(test_v2_kernels "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_v2_kernels.cpp")
+    target_link_libraries(test_v2_kernels PRIVATE gsv_engine)
+    add_test(NAME test_v2_kernels COMMAND test_v2_kernels)
 
     # 直接卷积 vs im2col+ggml_mul_mat 的 A/B（dec 主算子选型依据）
     add_executable(bench_conv1d "${CMAKE_CURRENT_SOURCE_DIR}/tests/bench_conv1d.cpp")

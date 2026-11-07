@@ -83,7 +83,19 @@
 //   GSV_V2_PEAK 可覆盖 roofline 峰值（默认 319 GFLOPS = tests/bwpeak.c 的 4 线程实测）。
 //   结论见 docs/ 或任务报告：dec 是 645k MAC/输出采样（20.6 GMAC/s 音频），
 //   fp32 在 4 核 Zen2 上的地板就是 0.162 RTF，别再往 0.10 上追；剩下的差距只能靠 int8。
+//
+// ============================================================================
+// 7) dec 的两条执行路径（GSV_V2_DEC=kernels|graph）
+// ============================================================================
+//   graph   : 整个 dec 交给 ggml 图（ggml_conv_direct_1d_fused），与历史行为一致。
+//   kernels : conv_pre/cond/ups_*/conv_post 仍然走 ggml， 而 resblock 的 45 对 conv
+//             改由 src/gsv_kernels.cpp 的 AVX2 内核算（fused bias+leaky+res，t 为 lane，
+//             输出直接落在 [T, C]）。执行方式是：按 build_dec 记录的节点范围把图
+//             分成 6 段（conv_pre+ups0, ups1..ups4, conv_post），每段之间插一次内核调用
+//             —— 也就是每个 stage 只有 1 次 fork-join，stage 内 RESBlock 链无屏障。
+//             resblock 的 ggml 节点仍然建在图中（保证 buffer 分配不变），只是不执行。
 #include "gsv_v2sovits.h"
+#include "gsv_kernels.h"
 
 #include "gsv_device.h"
 #include "gsv_encp.h"
@@ -326,6 +338,21 @@ struct gsv_v2sovits::impl {
     // 子像素上采样的相位分组（每个 stage 一组，组内按相位升序）
     struct v2_upg { std::string wname, bname; int ph0 = 0, ph1 = 0, dlo = 0, dhi = 0; };
     std::vector<std::vector<v2_upg>> up_groups;
+
+    // ---- GSV_V2_DEC=kernels 手写 ResBlock1 内核（src/gsv_kernels.*）----
+    bool use_kernels = false;               // 默认值在 load() 里按 env 决定
+    std::vector<float> rb_wpool;            // 重排后的权重池（[K][IC][OC]，oc 最快）
+    std::vector<gsv_rb_pair> rb_pairs;      // [n_stage][n_res][3]
+    std::vector<gsv_rb_stage> rb_stages;    // [n_stage]
+    // kernels 模式执行范围：[0]=conv_pre+cond+ups0, [1..n_stage-1]=ups_i, [n_stage]=conv_post
+    struct v2_krange { int s = 0, e = 0; };
+    std::vector<v2_krange> kparts;
+    std::vector<ggml_tensor *> kup;         // 每个 stage 的 ups 输出（内核的 in）
+    std::vector<ggml_tensor *> ksum;        // 每个 stage 的 resblock 输出（内核的 out）
+    ggml_context * sctx = nullptr;          // 复用一张子 cgraph 按范围执行
+    ggml_cgraph * sub = nullptr;
+    void run_range(int s, int e);
+    void prepare_kernels();
 
     v2_graph gvq, gflow, gdec;
 
@@ -789,6 +816,7 @@ void gsv_v2sovits::impl::build_dec(int T) {
     }
     const float mean_scale = 1.0f / (float) n_res;
     char wn[192];
+    kup.clear(); ksum.clear();
     for (int i = 0; i < n_stage; i++) {
         const int st = ups[(size_t) i];
         // ---- 子像素上采样：ConvTranspose1d(K, stride) == 相位分组 conv + 相位交织 ----
@@ -825,6 +853,7 @@ void gsv_v2sovits::impl::build_dec(int T) {
         ggml_tensor * yc = ggml_cont(c, yp);
         ggml_tensor * up = ggml_reshape_2d(c, yc, (int64_t) Tin * st, cout);              // [T·st, cout]
         h = up;
+        kup.push_back(up);      // kernels 模式：本 stage 交给 ggml 的节点到此为止
             // ---- 3 × ResBlock1 求和（第 j>0 块的求和融进第 3 对 conv 的 epilogue）----
         ggml_tensor * sum = nullptr;
         for (int j = 0; j < n_res; j++) {
@@ -850,6 +879,7 @@ void gsv_v2sovits::impl::build_dec(int T) {
             sum = sum ? ggml_add(c, sum, hx) : hx;
         }
         h = sum;   // 均值 1/3 与 LeakyReLU 融进下一级 conv 的 in_scale/in_slope
+        ksum.push_back(sum);
         }
     // conv_post (k=7 pad=3, 无 bias) + tanh；leaky_slope < 0 = tanh
     ggml_tensor * out = v2_conv(c, need("dec.conv_post.weight"), h,
@@ -859,6 +889,28 @@ void gsv_v2sovits::impl::build_dec(int T) {
     gdec.out = out;
     gdec.g = ggml_new_graph_custom(c, 65536, false);
     ggml_build_forward_expand(gdec.g, out);
+    // kernels 模式的执行边界（节点下标只有 build 之后才知道）：
+    //   part0 = conv_pre+cond+ups0, part_i = ups_i, part_n = conv_post
+    {
+        const int nn = ggml_graph_n_nodes(gdec.g);
+        auto producer = [&](ggml_tensor * t) {
+            for (int i = 0; i < nn; i++) if (ggml_graph_node(gdec.g, i) == t) return i;
+            return -1;
+        };
+        kparts.clear();
+        int prev = -1;
+        for (int i = 0; i < n_stage; i++) {
+            const int pu = producer(kup[(size_t) i]);
+            const int ps = producer(ksum[(size_t) i]);
+            if (pu < 0 || ps < 0 || ps < pu) {
+                fprintf(stderr, "[gsv_v2] dec 图边界定位失败 (stage %d: pu=%d ps=%d)\n", i, pu, ps);
+                abort();
+            }
+            kparts.push_back({ prev + 1, pu + 1 });
+            prev = ps;
+        }
+        kparts.push_back({ prev + 1, nn });
+    }
     gdec.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!ggml_gallocr_alloc_graph(gdec.ga, gdec.g)) {
         fprintf(stderr, "[gsv_v2] dec graph alloc failed (T=%d)\n", T);
@@ -1045,6 +1097,19 @@ gsv_v2sovits * gsv_v2sovits::load(const std::string & gguf_path, const gsv_v2sov
     s.create_folded();
     s.fill_folded();
 
+    // dec 的 ResBlock1 主循环：GSV_V2_DEC=kernels|graph 选路。
+    // 默认仍走 ggml graph：kernels 路径还没有干净的墙钟数据（共享机器上测不出来），
+    // 不想在没算过的情况下就悄悄换掉默认输出路径。等 lead 的串行化 A/B 下来再改这一行。
+    // kernels 模式需要一次性把 resblock 权重重排成 oc 最快布局（~44 MB）
+    {
+        const char * dm = getenv("GSV_V2_DEC");
+        s.use_kernels = (dm && strcmp(dm, "kernels") == 0) && is_cpu;
+        if (s.use_kernels) s.prepare_kernels();
+        if (cfg.verbose)
+            printf("[gsv_v2] dec 执行路径: %s (GSV_V2_DEC=%s)\n",
+                   s.use_kernels ? "kernels (手写 AVX2 ResBlock1)" : "ggml graph", dm ? dm : "<unset>");
+    }
+
     // enc_p（同一 GGUF 的 enc_p.* 前缀；v2 与 v5 的 TextEncoder 同构）
     {
         gsv_encp_cfg ec;
@@ -1164,6 +1229,101 @@ bool gsv_v2sovits::flow_reverse(const float * zp, int T, const float * ge, std::
 }
 
 // ------------------------------------------------------------------ dec
+// 把一个节点范围当成一张子图执行（kernels 模式用：跳掉 resblock 节点，
+// 其余（conv_pre/cond/ups_*/conv_post）照旧交给 ggml 图）。子 cgraph 复用。
+void gsv_v2sovits::impl::run_range(int s, int e) {
+    if (e <= s) return;
+    if (!sub) {
+        // 只装一张 cgraph（不装张量），1024 个节点绰绰有余
+        ggml_init_params ip = { (size_t) 1 << 20, nullptr, true };
+        sctx = ggml_init(ip);
+        sub = ggml_new_graph_custom(sctx, 1024, false);
+    }
+    ggml_graph_clear(sub);
+    for (int i = s; i < e; i++) ggml_graph_add_node(sub, ggml_graph_node(gdec.g, i));
+    if (ggml_backend_graph_compute(backend, sub) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "[gsv_v2] dec subgraph compute failed [%d,%d)\n", s, e);
+        abort();
+    }
+}
+
+// 把 dec.resblocks.* 的已折叠 F32 权重重排成 [K][IC][OC]（oc 最快），
+// 供 gsv_v2_dec_resblocks 直接用。总量 = 5 个 stage 共 ~44 MB。
+void gsv_v2sovits::impl::prepare_kernels() {
+    const int n_pairs = 3;
+    char wn[192];
+
+    // 第一遍：量一下权重池大小（每对的 C 由张量形状决定）
+    size_t total = 0;
+    for (int i = 0; i < n_stage; i++)
+        for (int b = 0; b < n_res; b++)
+            for (int p = 0; p < n_pairs; p++) {
+                snprintf(wn, sizeof(wn), "dec.resblocks.%d.convs1.%d.weight", i * n_res + b, p);
+                ggml_tensor * w1 = need(wn);
+                const int K = (int) w1->ne[0], C = (int) w1->ne[1];
+                total += 2 * (size_t) K * C * C + 2 * (size_t) C;
+            }
+    rb_wpool.assign(total, 0.0f);
+    rb_pairs.assign((size_t) n_stage * n_res * n_pairs, gsv_rb_pair{});
+    rb_stages.assign((size_t) n_stage, gsv_rb_stage{});
+
+    size_t off = 0;
+    std::vector<float> tmp;
+    for (int i = 0; i < n_stage; i++) {
+        for (int b = 0; b < n_res; b++) {
+            const int blk = i * n_res + b;
+            for (int p = 0; p < n_pairs; p++) {
+                gsv_rb_pair & pr = rb_pairs[(size_t) blk * n_pairs + p];
+                // 注意：核长跟**块**走（block0=3, block1=7, block2=11），膨胀率跟对走（1,3,5）
+                // —— 一律以权重形状为准，不要用 res_k 推
+                const int dil = res_dil[(size_t) p];
+                snprintf(wn, sizeof(wn), "dec.resblocks.%d.convs1.%d.weight", blk, p);
+                ggml_tensor * w1 = need(wn);
+                const int K = (int) w1->ne[0], C = (int) w1->ne[1];
+                snprintf(wn, sizeof(wn), "dec.resblocks.%d.convs2.%d.weight", blk, p);
+                ggml_tensor * w2 = need(wn);
+                if ((int) w2->ne[0] != K ||
+                    (int) w1->ne[2] != C || (int) w2->ne[2] != C) {
+                    fprintf(stderr, "[gsv_v2] resblock %d conv%d 形状异常: K=%d w1=[%d,%d,%d] w2=[%d,%d,%d]\n",
+                            blk, p, K, (int) w1->ne[0], (int) w1->ne[1], (int) w1->ne[2],
+                            (int) w2->ne[0], (int) w2->ne[1], (int) w2->ne[2]);
+                    abort();
+                }
+                const size_t wn_f = (size_t) K * C * C;
+                pr.w1 = rb_wpool.data() + off; tmp.resize(wn_f);
+                ggml_backend_tensor_get(w1, tmp.data(), 0, wn_f * 4);
+                gsv_v2_repack_w(tmp.data(), rb_wpool.data() + off, K, C, C);
+                off += wn_f;
+
+                snprintf(wn, sizeof(wn), "dec.resblocks.%d.convs1.%d.bias", blk, p);
+                pr.b1 = rb_wpool.data() + off; tmp.resize((size_t) C);
+                ggml_backend_tensor_get(need(wn), tmp.data(), 0, (size_t) C * 4);
+                memcpy(rb_wpool.data() + off, tmp.data(), (size_t) C * 4);
+                off += (size_t) C;
+
+                pr.w2 = rb_wpool.data() + off; tmp.resize(wn_f);
+                ggml_backend_tensor_get(w2, tmp.data(), 0, wn_f * 4);
+                gsv_v2_repack_w(tmp.data(), rb_wpool.data() + off, K, C, C);
+                off += wn_f;
+
+                snprintf(wn, sizeof(wn), "dec.resblocks.%d.convs2.%d.bias", blk, p);
+                pr.b2 = rb_wpool.data() + off; tmp.resize((size_t) C);
+                ggml_backend_tensor_get(need(wn), tmp.data(), 0, (size_t) C * 4);
+                memcpy(rb_wpool.data() + off, tmp.data(), (size_t) C * 4);
+                off += (size_t) C;
+
+                pr.K = K; pr.dil = dil;
+                pr.pad1 = (K / 2) * dil;    // conv1: pad = (K/2)*dil（dilated）
+                pr.pad2 = K / 2;            // conv2: pad = K/2, dil=1
+            }
+        }
+    }
+    if (off != total) { fprintf(stderr, "[gsv_v2] rb 权重池大小不符 %zu/%zu\n", off, total); abort(); }
+    if (getenv("GSV_V2_DEBUG"))
+        printf("[gsv_v2] resblock 内核权重池 %.1f MB（%zu 对 conv）\n",
+               (double) total * 4 / 1048576.0, rb_pairs.size());
+}
+
 bool gsv_v2sovits::decode_wav(const float * z, int T, const float * ge, std::vector<float> & wav) {
     impl & s = *p;
     const auto t0 = std::chrono::steady_clock::now();
@@ -1171,7 +1331,68 @@ bool gsv_v2sovits::decode_wav(const float * z, int T, const float * ge, std::vec
     std::vector<float> x(z, z + (size_t) T * s.hidden);
     ggml_backend_tensor_set(s.gdec.in, x.data(), 0, x.size() * 4);
     ggml_backend_tensor_set(s.gdec.ge, ge, 0, (size_t) s.gin * 4);
-    if (ggml_backend_graph_compute(s.backend, s.gdec.g) != GGML_STATUS_SUCCESS) {
+    if (s.use_kernels) {
+        // kernels 模式：ggml 只负责 conv_pre/cond/ups_*/conv_post，resblock 交给
+        // gsv_v2_dec_resblocks（每个 stage 1 次 fork-join，stage 内无屏障）
+        if (s.rb_stages.empty() || s.rb_stages[0].T != (int) s.kup[0]->ne[0]) {
+            for (int i = 0; i < s.n_stage; i++) {
+                gsv_rb_stage & st = s.rb_stages[(size_t) i];
+                st.T = (int) s.kup[(size_t) i]->ne[0];
+                st.C = (int) s.kup[(size_t) i]->ne[1];
+                st.n_blocks = s.n_res;
+                st.n_pairs = 3;
+                st.pairs = s.rb_pairs.data() + (size_t) i * s.n_res * 3;
+                if ((int) s.ksum[(size_t) i]->ne[0] != st.T || (int) s.ksum[(size_t) i]->ne[1] != st.C) {
+                    fprintf(stderr, "[gsv_v2] stage %d 张量形状不符\n", i);
+                    return false;
+                }
+            }
+        }
+        // GSV_V2_AB=1：同一份输入先跑图、再跑内核，各计一次（干扰大的机器上
+        // 跨进程比较毫无意义，同窗口背对背才是可用的相对值）
+        const bool ab = getenv("GSV_V2_AB") != nullptr;
+        const bool prof = getenv("GSV_V2_PROFILE") != nullptr;
+        double t_graph = -1.0;
+        if (ab) {
+            const auto tg = std::chrono::steady_clock::now();
+            if (ggml_backend_graph_compute(s.backend, s.gdec.g) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "[gsv_v2] dec graph compute failed (AB)\n");
+                return false;
+            }
+            t_graph = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - tg).count();
+        }
+        double t_kern = 0.0;
+        for (int i = 0; i <= s.n_stage; i++) {
+            s.run_range(s.kparts[(size_t) i].s, s.kparts[(size_t) i].e);
+            if (i < s.n_stage) {
+                const auto tk = std::chrono::steady_clock::now();
+                gsv_v2_dec_resblocks(s.rb_stages[(size_t) i],
+                                     (const float *) s.kup[(size_t) i]->data,
+                                     (float *) s.ksum[(size_t) i]->data,
+                                     s.n_threads > 0 ? s.n_threads : 4);
+                const double dt = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - tk).count();
+                t_kern += dt;
+                if (prof) {
+                    const gsv_rb_stage & st = s.rb_stages[(size_t) i];
+                    double mac = 0.0;
+                    for (int b = 0; b < st.n_blocks; b++)
+                        for (int q = 0; q < st.n_pairs; q++) {
+                            const gsv_rb_pair & pr = st.pairs[(size_t) b * st.n_pairs + q];
+                            mac += 2.0 * (double) st.T * st.C * st.C * pr.K;
+                        }
+                    printf("  [kern] stage%d C=%d T=%d %8.2f ms %6.1f GFLOPS %5.1f%% peak\n",
+                           i, st.C, st.T, dt, 2.0 * mac / (dt * 1e6),
+                           100.0 * (2.0 * mac / (dt * 1e6)) / 319.0);
+                }
+            }
+        }
+        if (ab || prof)
+            printf("  [dec] graph %.1f ms | kernels(仅 resblock) %.1f ms | 2阶段共 %d 次 fork-join\n",
+                   t_graph, t_kern, s.n_stage);
+        fflush(stdout);
+    } else if (ggml_backend_graph_compute(s.backend, s.gdec.g) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[gsv_v2] dec graph compute failed\n");
         return false;
     }
