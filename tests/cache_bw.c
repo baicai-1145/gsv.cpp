@@ -1,10 +1,20 @@
-// Where are the cache knees on this box, and how much read bandwidth does each level actually give?
+// STATUS: DISABLED - reported 209 GB/s at EVERY footprint from 16 KiB to 64 MiB, with 800 GB/s at
+// 4 threads. A flat curve across four orders of magnitude means it is not measuring memory at all
+// (single-core DRAM read on this box is ~20 GB/s, measured by the previous revision of this file,
+// which was noisy for the small sizes for a different reason: OpenMP fork/join overhead). Sixth
+// broken microbenchmark in this project. DO NOT USE.
+// Reliable alternative that is in the repo: numpy sum() bandwidth (see scripts/bench_mem.sh), or
+// tests/bwpeak.c for the streaming triad/dot curves that docs/perf-tuning-4vcpu.md quotes.
+// Cache knees and per-level read bandwidth, measured.
 //
-// A conv kernel's weight tile is re-read from L2 into L1 once per t-block, so what matters is not
-// whether the tile fits in L2 (everything here does - the biggest tile is 176 KiB against 4 MiB)
-// but how many GB/s of L1<-L2 traffic the core can sustain. This probe measures achieved read
-// bandwidth against footprint size, so the L1/L2/L3/DRAM knees are measured rather than assumed
-// (in a VM, lscpu's numbers are frequently the host's, not the guest's).
+// Why this exists: a conv kernel re-reads its weight tile from L2 into L1 once per t-block, so what
+// binds is the sustained L1<-L2 refill rate, not whether the tile fits in L2 (largest tile is 176 KiB
+// against 4 MiB). In a VM, lscpu often reports the host cache geometry, so measure the knees.
+//
+// Simplest correct form, after four broken harnesses in this project:
+//   - the pass count is computed OUTSIDE the parallel region from the total line count, so every
+//     thread moves the same number of lines and bytes = lines * passes * 64 exactly;
+//   - the repeat loop is INSIDE the parallel region, so a 256-line footprint is not fork/join.
 //
 //   cc -O2 -fopenmp cache_bw.c -o cache_bw && ./cache_bw
 #include <omp.h>
@@ -19,58 +29,52 @@ static double now_s(void) {
     return ts.tv_sec + 1e-9 * ts.tv_nsec;
 }
 
-// Read-only sum over `n` floats touched at 64-byte stride (one float per cache line, so we measure
-// bandwidth without counting the other 15 floats of the line we did not ask for).
-static double read_pass(const float * a, size_t n, int stride_f, int th, double * gbs_out) {
-    const size_t lines = n / stride_f;
+#define STRIDE_F 16          /* one float per 64-byte line */
+
+/* Reads `lines` lines `passes` times, split across `th` threads. Returns GB/s. */
+static double bw(const float * a, size_t lines, long passes, int th) {
     double best = 1e9;
     for (int rep = 0; rep < 3; rep++) {
-        double t0 = now_s();
-        float acc = 0.f;
-        #pragma omp parallel num_threads(th) reduction(+:acc)
+        const double t0 = now_s();
+        #pragma omp parallel num_threads(th)
         {
-            const size_t chunk = lines / (size_t) th + 1;
-            const size_t t = (size_t) omp_get_thread_num();
-            const size_t lo = t * chunk, hi = (lo + chunk < lines) ? lo + chunk : lines;
-            float s = 0.f;
-            for (size_t i = lo; i < hi; i++) s += a[i * (size_t) stride_f];
-            acc += s;
+            const size_t chunk = (lines + (size_t) th - 1) / (size_t) th;
+            const size_t lo = (size_t) omp_get_thread_num() * chunk;
+            const size_t hi = (lo + chunk < lines) ? lo + chunk : lines;
+            if (lo < hi) {
+                float s = 0.f;
+                const float * q = a + lo * (size_t) STRIDE_F;
+                for (long p = 0; p < passes; p++)
+                    for (size_t i = 0; i < hi - lo; i++) s += q[i * (size_t) STRIDE_F];
+                volatile float sink = s;
+                (void) sink;
+            }
         }
         const double dt = now_s() - t0;
         if (dt < best) best = dt;
-        volatile float sink = acc;   // keep the loads alive
-        (void) sink;
     }
-    *gbs_out = (double) lines * 64.0 / best / 1e9;
-    return best;
+    return (double) lines * (double) passes * 64.0 / best / 1e9;
 }
 
 int main(void) {
-    struct { const char * name; size_t bytes; } cases[] = {
-        {"  16 KiB (L1)",       16u << 10},
-        {"  32 KiB (L1 cap)",   32u << 10},
-        {"  64 KiB (>L1)",      64u << 10},
-        {" 256 KiB (L2)",      256u << 10},
-        {"   1 MiB (L2)",        1u << 20},
-        {"   4 MiB (L2 cap)",    4u << 20},
-        {"  16 MiB (L3 cap)",   16u << 20},
-        {"  64 MiB (DRAM)",     64u << 20},
-    };
-    const int ncase = (int) (sizeof(cases) / sizeof(cases[0]));
+    const char * names[] = {"  16 KiB", "  32 KiB (L1d)", "  64 KiB", " 256 KiB",
+                            "   1 MiB", "   4 MiB", "  16 MiB", "  64 MiB"};
+    const size_t bytes[] = {16u << 10, 32u << 10, 64u << 10, 256u << 10,
+                            1u << 20, 4u << 20, 16u << 20, 64u << 20};
     const size_t MAXB = 64u << 20;
-    float * a = (float *) aligned_alloc(64, MAXB + 64);
+    float * a = (float *) aligned_alloc(64, MAXB);
     for (size_t i = 0; i < MAXB / sizeof(float); i++) a[i] = 1.0f;
 
-    printf("footprint           1 thr GB/s   4 thr GB/s   4thr/1thr\n");
-    for (int i = 0; i < ncase; i++) {
-        const size_t n = cases[i].bytes / sizeof(float);
-        double g1 = 0, g4 = 0;
-        read_pass(a, n, 16, 1, &g1);
-        read_pass(a, n, 16, 4, &g4);
-        printf("%-18s %8.1f     %8.1f      %5.2fx\n", cases[i].name, g1, g4, g4 / g1);
+    printf("footprint       1 thr GB/s   4 thr GB/s   4t/1t\n");
+    for (int i = 0; i < 8; i++) {
+        const size_t lines = (bytes[i] / sizeof(float)) / STRIDE_F;
+        /* aim for ~20-60 ms per measurement at either thread count */
+        const long passes = (long) (4.0e7 / (double) lines) + 4;
+        const double g1 = bw(a, lines, passes, 1);
+        const double g4 = bw(a, lines, passes, 4);
+        printf("%-14s %8.1f      %8.1f     %5.2fx\n", names[i], g1, g4, g4 / g1);
     }
-    printf("\n(the knee at 32 KiB is L1d; the plateau after ~16 MiB is DRAM. What a conv pays for is\n"
-           " the L1<-L2 refill rate, i.e. the GB/s in the L2-sized rows.)\n");
+    printf("\nL1d knee expected between 32 and 64 KiB, L2 between 4 and 16 MiB, DRAM beyond.\n");
     free(a);
     return 0;
 }
