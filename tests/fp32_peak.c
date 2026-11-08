@@ -1,3 +1,11 @@
+// STATUS: DISABLED - the numbers this produced were impossible (105 GMAC/s single-thread = 40
+// MAC/cycle against a hardware limit of 16), i.e. gcc collapsed the 16 dependent FMA chains whose
+// multiplier and addend are compile-time constants (a=fma(a,m,c) unrolled is a closed form). The
+// self-controls did not catch it because both variants scale with the iteration count equally.
+// This is the fourth broken microbenchmark in this project (see tests/chains.c, tests/conv_bench.c).
+// DO NOT USE these numbers. The fp32 ceiling on this box is instead taken from OpenBLAS sgemm
+// through numpy (a known-good implementation that reaches 85-95% of FMA peak on Zen2): see
+// docs/perf-tuning-4vcpu.md "fp32 理论峰值" for the measured table.
 // What is this box's real fp32 FMA peak? Measured so the answer does not depend on assuming a
 // clock frequency.
 //
