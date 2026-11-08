@@ -29,7 +29,7 @@ static double now_s(void) {
 
 static double bench(int nacc, int th);
 
-#define BODY(N, ...)                                                            \
+#define BODY(N, ...)  /* N = accumulator chains */                              \
     double best = 1e9;                                                          \
     for (int rep = 0; rep < 3; rep++) {                                          \
         const double t0 = now_s();                                              \
@@ -49,7 +49,7 @@ static double bench(int nacc, int th);
         const double dt = now_s() - t0;                                          \
         if (dt < best) best = dt;                                                \
     }                                                                            \
-    return (double) nacc * ITERS * th / best / 1e9;   /* GFMA/s (GMAC/s) */
+    return (double) N * ITERS * th / best / 1e9;   /* GFMA/s (GMAC/s) */
 
 // 4 chains
 #define X4_DECL __m256 a0 = c, a1 = c, a2 = c, a3 = c;
