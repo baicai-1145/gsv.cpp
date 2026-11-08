@@ -109,3 +109,26 @@ AR/cond/vocoder stages. --threads N overrides the default.
 - **Larger conv tiles** in conv_direct_1d were not beneficial: the kernel already uses 6-wide
   time blocks x 16-wide output blocks, and DiT (the dominant CPU stage) is memory-bound, so
   thread count beyond 8 did not move it.
+
+## v2 / v2SoVITS pipeline on two cloud boxes (2026-11-08)
+
+Same text, same 8.3 s reference wav, same fixture, gguf q8 AR + v2sovits + distilled HuBERT frontend
+(after the frontend/KV changes in `2e5d753`). Decode length 7.44 s of audio.
+
+| box | cores | ISA | threads | enc_p | flow | dec | synth | AR | **RTF synth** | **RTF total** | peak RSS |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| shanghai4c4g (EPYC 7K62) | 4 physical | AVX2 | 4 | 155 | 45 | 1488 | 1689 | 1500 | **0.233** | **0.435** | 842 MiB |
+| seoul2c2g (EPYC 9754) | 1 physical + SMT2 | AVX2 | 1 | 177 | 108 | 5180 | 5466 | 2683 | **0.735** | **1.095** | 862 MiB |
+| seoul2c2g | 1 physical + SMT2 | AVX2 | 2 | 196 | 104 | 4521 | 4823 | 2553 | **0.648** | **0.991** | 862 MiB |
+
+Both boxes produce the same waveform: `cos=0.999917`, `max_abs=1.293e-02`, `peak=0.5471`.
+
+Reading the two rows: one Zen4 core beats one Zen2 core by roughly 1.7x (bare ggml conv_1d 13.54 vs
+7.87 GMAC/s, mul_mat GEMV 15.20 vs 10.36 GMAC/s), so per-core the Zen4 box is the better buy - but
+four cores still win on wall clock, which is what RTF measures. A 4-core Zen4 host would be expected
+to land near RTF 0.18 synth.
+
+**Do not build either of these with `-DGGML_NATIVE=ON` on Zen4.** The same seoul box with an
+AVX-512 ggml measured RTF 6.41 (dec 43.6 s, AR 60 s) - an 8-10x slowdown from the flag alone. See the
+warning in `build.md` and `tests/bench_ggml_min.c`, which reports a box's ggml health in three
+seconds.
