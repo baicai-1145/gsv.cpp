@@ -56,7 +56,7 @@ static double run_fp32(const float * W, const float * A, float * C, int T, int t
         #pragma omp parallel for num_threads(th) schedule(static)
         for (int oc0 = 0; oc0 < OC; oc0 += 2) {
             const float * w0 = W + (size_t) 0 * IC * OC + (size_t) 0 * OC + oc0;
-            for (int t0 = 0; t0 < T; t0 += 8) {
+            for (int t0 = 0; t0 + 15 < T; t0 += 16) {
                 __m256 c00 = _mm256_setzero_ps(), c01 = _mm256_setzero_ps();
                 __m256 c10 = _mm256_setzero_ps(), c11 = _mm256_setzero_ps();
                 for (int k = 0; k < K; k++) {
@@ -73,8 +73,10 @@ static double run_fp32(const float * W, const float * A, float * C, int T, int t
                     }
                 }
                 (void) w0;
-                _mm256_storeu_ps(C + (size_t) (oc0 + 0) * T + t0, _mm256_add_ps(c00, c01));
-                _mm256_storeu_ps(C + (size_t) (oc0 + 1) * T + t0, _mm256_add_ps(c10, c11));
+                _mm256_storeu_ps(C + (size_t) (oc0 + 0) * T + t0, c00);
+                _mm256_storeu_ps(C + (size_t) (oc0 + 0) * T + t0 + 8, c01);
+                _mm256_storeu_ps(C + (size_t) (oc0 + 1) * T + t0, c10);
+                _mm256_storeu_ps(C + (size_t) (oc0 + 1) * T + t0 + 8, c11);
             }
         }
         double dt = now_s() - t0;
@@ -159,15 +161,16 @@ int main(int argc, char ** argv) {
 
     double tf = run_fp32(W, A, C, T, th, reps);
     printf("fp32      : T=%d  %8.1f ms  %8.1f GMAC/s  %6.1f%% of 319 GFLOPS peak\n",
-           T, tf * 1e3, macs / tf / 1e9, macs / tf / 159.5);
+           T, tf * 1e3, macs / tf / 1e9, macs / tf / 1e9 * 2.0 / 319.3 * 100.0);
 
     double tq = quant_pass(A, A8, scale, T);
     printf("quant act : T=%d  %8.1f ms  (%.1f%% of the conv time, one pass)\n", T, tq * 1e3, 100 * tq / tf);
 
-    double ti = run_int8(W8, A8, Ci, T, th, reps);
-    printf("int8      : T=%d  %8.1f ms  %8.1f GMAC/s  %6.1f%% of 319 GFLOPS peak  = %.2fx fp32\n",
-           T, ti * 1e3, macs / ti / 1e9, macs / ti / 159.5, tf / ti);
-    printf("int8+quant: T=%d  %8.1f ms  (conv + activation quantisation)  = %.2fx fp32\n",
-           T, (ti + tq) * 1e3, tf / (ti + tq));
+    // The hand-rolled int8 path below does NOT compute the same convolution (its inner loop
+    // dots 32 consecutive t against 32 consecutive oc), so its timing is meaningless and it is
+    // disabled. Measuring the int8 ceiling has to go through ggml's own quantised GEMM kernels
+    // (vec_dot_q8_0_q8_1), not through a kernel written in an afternoon.
+    (void) run_int8; (void) Ci; (void) W8; (void) A8;
+    printf("int8      : not measured here - use ggml's q8_0 GEMM path (see tests/conv_bench README note)\n");
     return 0;
 }
