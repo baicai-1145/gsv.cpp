@@ -49,6 +49,7 @@ static double bench_avx2(int chains, int th) {
         {
             A2_DECL A2_INIT
             for (long it = 0; it < ITERS; it++) {
+                __asm__ __volatile__("" ::: "memory");
                 if (chains >= 12) { A2_STEP A2_STEP }
                 else { a0=_mm256_fmadd_ps(a0,m,c); a1=_mm256_fmadd_ps(a1,m,c);
                        a2=_mm256_fmadd_ps(a2,m,c); a3=_mm256_fmadd_ps(a3,m,c);
@@ -79,6 +80,7 @@ static double bench_avx512(int th) {
         {
             __m512 a0=c,a1=c,a2=c,a3=c,a4=c,a5=c,a6=c,a7=c,a8=c,a9=c,aa=c,ab=c;
             for (long it = 0; it < ITERS; it++) {
+                __asm__ __volatile__("" ::: "memory");
                 #define S(x) x = _mm512_fmadd_ps(x, m, c);
                 S(a0) S(a1) S(a2) S(a3) S(a4) S(a5) S(a6) S(a7) S(a8) S(a9) S(aa) S(ab)
                 S(a0) S(a1) S(a2) S(a3) S(a4) S(a5) S(a6) S(a7) S(a8) S(a9) S(aa) S(ab)
@@ -110,6 +112,7 @@ static double bench_vnni(int th) {
         {
             __m512i a0=acc0,a1=acc0,a2=acc0,a3=acc0,a4=acc0,a5=acc0,a6=acc0,a7=acc0;
             for (long it = 0; it < ITERS; it++) {
+                __asm__ __volatile__("" ::: "memory");
                 #define D(x) x = _mm512_dpbusd_epi32(x, u, s);
                 D(a0) D(a1) D(a2) D(a3) D(a4) D(a5) D(a6) D(a7)
                 D(a0) D(a1) D(a2) D(a3) D(a4) D(a5) D(a6) D(a7)
@@ -129,6 +132,13 @@ static double bench_vnni(int th) {
 }
 #endif
 
+static void verdict(const char * name, double gmacs, int lanes, double ghz, int th) {
+    // one FMA instruction does `lanes` MACs; at most 2 FMA instructions per cycle per core
+    const double fma_per_cycle = gmacs * 1e9 / (double) lanes / (ghz * 1e9) / (double) th;
+    printf("   implied %.2f FMA/cycle/thread %s\n", fma_per_cycle,
+           fma_per_cycle > 2.2 ? "  << IMPOSSIBLE -> loop was optimised away, DISCARD" : "  (ok)");
+}
+
 int main(int argc, char ** argv) {
     const int th = argc > 1 ? atoi(argv[1]) : 2;
     printf("threads=%d   (volatile operands: no constant folding; result printed so nothing is dead)\n\n", th);
@@ -137,14 +147,18 @@ int main(int argc, char ** argv) {
     printf("control: AVX2 4 chains = %.1f GMAC/s, 12 chains = %.1f GMAC/s, ratio %.2f (expect >2)\n",
            c4, c12, c4 / c12);
 
-    printf("\n  unit         GMAC/s   %% of fp32 peak (16 MAC/cyc/thread)\n");
+    const double GHZ = 3.077;   // measured with clock_probe (dependent add chain, 4 rows agree)
+    printf("\n  unit            GMAC/s\n");
     const double a2 = bench_avx2(12, th);
-    printf("  AVX2  fma      %7.1f   %6.1f%%\n", a2, 0.0);
+    printf("  AVX2  fma      %7.1f\n", a2);
+    verdict("AVX2", a2, 8, GHZ, th);
 #ifdef __AVX512F__
     const double a5 = bench_avx512(th);
-    printf("  AVX-512 fma    %7.1f   (2x the AVX2 width)\n", a5);
+    printf("  AVX-512 fma    %7.1f\n", a5);
+    verdict("AVX-512", a5, 16, GHZ, th);
     const double vn = bench_vnni(th);
-    printf("  AVX-512 VNNI   %7.1f   int8, vpdpbusd 64 MAC/instr\n", vn);
+    printf("  AVX-512 VNNI   %7.1f  (int8, vpdpbusd = 64 MAC/instr)\n", vn);
+    verdict("VNNI", vn, 64, GHZ, th);
     printf("\n  AVX-512 / AVX2 fp32 ratio = %.2fx\n", a5 / a2);
     printf("  VNNI int8 / AVX-512 fp32  = %.2fx\n", vn / a5);
 #endif
