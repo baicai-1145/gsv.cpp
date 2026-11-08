@@ -84,6 +84,14 @@ Windows: add `-G "Visual Studio 17 2022" -A x64` to the configure step (the libr
 
 ```bash
 cmake -S llama.cpp -B llama.cpp/build-cpu-rel \
+  # WARNING: do not replace the flags above with -DGGML_NATIVE=ON on Zen4.
+  # On an EPYC 9754 (Bergamo) VM, GGML_NATIVE=ON selects the AVX-512 kernels and they are
+  # 8-10x SLOWER than the AVX2 ones for exactly the ops this pipeline runs (measured with
+  # tests/bench_ggml_min.c, same binary, same box, only the ggml build differing):
+  #     AVX2   build: mul_mat GEMV 15.20 GMAC/s   conv_1d 13.54 GMAC/s
+  #     AVX-512 build: mul_mat GEMV  1.73 GMAC/s   conv_1d  1.33 GMAC/s
+  # End to end that turned a 1.7 s decode into 43.6 s and RTF 0.23 into 6.41. The documented
+  # flags are the fast ones; GGML_NATIVE=ON is a trap on this hardware.
   -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
   -DGGML_BUILD_TESTS=OFF -DLLAMA_BUILD_TESTS=OFF \
   -DCMAKE_BUILD_TYPE=Release
