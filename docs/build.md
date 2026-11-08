@@ -52,10 +52,17 @@ commit is pinned in `.github/workflows/ci.yml` (`LLAMA_CPP_COMMIT`):
 git clone https://github.com/ggml-org/llama.cpp
 git -C llama.cpp checkout f0c41e0168dfd4b5ef72b21d1a311b24cc7a894a
 git -C llama.cpp apply ../patches/0001-ggml-audio-patch-port-on-llamacpp.patch
+git -C llama.cpp apply ../patches/0002-ggml-conv-direct-1d-vectorised-epilogue.patch   # optional, see below
 ```
 
 > The patch is what makes `ggml_conv_1d`, `ggml_conv_transpose_1d`, `ggml_pad_reflect_1d` and the
 > sub-pixel path available. Without it the engine does not compile.
+
+> `0002` is optional and pure performance: it vectorises the `conv_direct_1d` epilogue (the old one
+> did a 6x16 -> 16x6 register transpose through 96 scalar stores) and folds bias+leaky in. It is
+> bit-identical to the unpatched kernel at the pipeline level (same WAV md5), so it cannot change
+> output; it helps most on the small-channel tail shapes (K=3: 42% -> 75% of the AVX2-FMA peak).
+> If you skip it, nothing else breaks.
 
 ## 3. Build ggml
 
