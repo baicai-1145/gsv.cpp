@@ -1,3 +1,15 @@
+// STATUS: DISABLED - seven revisions, all wrong. Across revisions the "AVX2 12-chain" figure
+// stayed pinned at 588-589 GMAC/s while every other configuration changed, i.e. that number is a
+// measurement artefact and not throughput; the built-in impossible-value check (implied FMA/cycle
+// must be <= 2) flags it correctly, but nothing here can be trusted as a ceiling. Lesson recorded
+// rather than a number: on-box microbenchmarks of FMA throughput are harder than they look
+// (constant folding, closed-form recurrence collapse, SMT effects), and the only figures kept in
+// this repo are ones cross-checked against a known-good implementation (OpenBLAS sgemm) or
+// against wall-clock end-to-end timings of the real engine.
+// For the record, theory + the measured 3.077 GHz clock on the Zen4 box gives, per core:
+//   AVX2   fp32 : 16 MAC/cycle =  49 GMAC/s
+//   AVX-512 fp32: 32 MAC/cycle =  98 GMAC/s
+//   VNNI   int8 : 128 MAC/cycle = 394 GMAC/s
 // SIMD throughput ceiling for this machine: AVX2 FMA vs AVX-512 FMA vs AVX-512 VNNI int8.
 //
 // Written after four broken microbenchmarks on the previous box, so the guards here are explicit:
@@ -41,7 +53,7 @@ static volatile unsigned char g_u8[64];
 #define A2_SUM (a0+a1+a2+a3+a4+a5+a6+a7+a8+a9+aa+ab)
 
 static double bench_avx2(int chains, int th) {
-    const __m256 m = _mm256_set1_ps(g_mul), c = _mm256_set1_ps(g_add);
+    __m256 m = _mm256_set1_ps(g_mul), c = _mm256_set1_ps(g_add);
     double best = 1e9;
     for (int rep = 0; rep < 3; rep++) {
         const double t0 = now_s();
@@ -49,7 +61,7 @@ static double bench_avx2(int chains, int th) {
         {
             A2_DECL A2_INIT
             for (long it = 0; it < ITERS; it++) {
-                __asm__ __volatile__("" ::: "memory");
+                m = _mm256_set1_ps(g_mul); c = _mm256_set1_ps(g_add);
                 if (chains >= 12) { A2_STEP A2_STEP }
                 else { a0=_mm256_fmadd_ps(a0,m,c); a1=_mm256_fmadd_ps(a1,m,c);
                        a2=_mm256_fmadd_ps(a2,m,c); a3=_mm256_fmadd_ps(a3,m,c);
@@ -72,7 +84,7 @@ static double bench_avx2(int chains, int th) {
 #ifdef __AVX512F__
 /* ---------------- AVX-512: 12 x __m512 FMA ---------------- */
 static double bench_avx512(int th) {
-    const __m512 m = _mm512_set1_ps(g_mul), c = _mm512_set1_ps(g_add);
+    __m512 m = _mm512_set1_ps(g_mul), c = _mm512_set1_ps(g_add);
     double best = 1e9;
     for (int rep = 0; rep < 3; rep++) {
         const double t0 = now_s();
@@ -80,7 +92,7 @@ static double bench_avx512(int th) {
         {
             __m512 a0=c,a1=c,a2=c,a3=c,a4=c,a5=c,a6=c,a7=c,a8=c,a9=c,aa=c,ab=c;
             for (long it = 0; it < ITERS; it++) {
-                __asm__ __volatile__("" ::: "memory");
+                m = _mm512_set1_ps(g_mul); c = _mm512_set1_ps(g_add);
                 #define S(x) x = _mm512_fmadd_ps(x, m, c);
                 S(a0) S(a1) S(a2) S(a3) S(a4) S(a5) S(a6) S(a7) S(a8) S(a9) S(aa) S(ab)
                 S(a0) S(a1) S(a2) S(a3) S(a4) S(a5) S(a6) S(a7) S(a8) S(a9) S(aa) S(ab)
@@ -103,8 +115,7 @@ static double bench_avx512(int th) {
 /* ---------------- AVX-512 VNNI: int8 dot, vpdpbusd = 64 int8 MAC per instruction ------------ */
 static double bench_vnni(int th) {
     const __m512i acc0 = _mm512_setzero_si512();
-    const __m512i u = _mm512_set1_epi8((char) 3);
-    const __m512i s = _mm512_set1_epi8((char) 2 - 128);
+    __m512i uu, ss;
     double best = 1e9;
     for (int rep = 0; rep < 3; rep++) {
         const double t0 = now_s();
@@ -113,7 +124,8 @@ static double bench_vnni(int th) {
             __m512i a0=acc0,a1=acc0,a2=acc0,a3=acc0,a4=acc0,a5=acc0,a6=acc0,a7=acc0;
             for (long it = 0; it < ITERS; it++) {
                 __asm__ __volatile__("" ::: "memory");
-                #define D(x) x = _mm512_dpbusd_epi32(x, u, s);
+                uu = _mm512_set1_epi8((char) 3); ss = _mm512_set1_epi8((char) 2 - 128);
+                #define D(x) x = _mm512_dpbusd_epi32(x, uu, ss);
                 D(a0) D(a1) D(a2) D(a3) D(a4) D(a5) D(a6) D(a7)
                 D(a0) D(a1) D(a2) D(a3) D(a4) D(a5) D(a6) D(a7)
                 #undef D
