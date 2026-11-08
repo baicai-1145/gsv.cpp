@@ -257,8 +257,12 @@ gsv_engine * gsv_engine::load(const gsv_engine_cfg & cfg) {
                 // 没显式给文件: 先看两个默认名哪个存在
                 const std::string def_h = s.pick("", "gsv-hubert-f16.gguf");
                 const std::string def_d = s.pick("", "gsv-dhubert.gguf");
-                path = (!is_dh && fe_exists(def_h)) ? def_h
-                     : (fe_exists(def_d) ? def_d : def_h);
+                // 默认优先蒸馏前端: 参考侧快 ~48x, 且省掉教师 360 MiB 权重 + 134 MiB 图 arena,
+                // 波形与教师前端逐位相同 (wav cos 0.999917 不变)。
+                // 教师仍可用 --hubert-frontend teacher / GSV_HUBERT_FRONTEND=teacher 显式选择。
+                if (is_h && fe_exists(def_h))      path = def_h;
+                else if (fe_exists(def_d))         path = def_d;
+                else                               path = def_h;
             }
             const std::string arch = peek_gguf_arch(path);
             const bool arch_dh = arch == "gsv-dhubert";

@@ -661,7 +661,15 @@ if (!dev) { fprintf(stderr, "[gsv_ar] no usable backend device"); delete m; retu
     }
 
     g_prof = getenv("GSV_AR_PROFILE") != nullptr;
-    s.kv_f16 = getenv("GSV_AR_KV_F16") != nullptr;
+    // 默认 f16: KV buffer 222 MiB -> 111 MiB, 且每步 k/v 写入与 attention 读取流量减半。
+    // 实测波形不变 (wav cos 0.999917 / max_abs 1.293e-02, AR 1531 -> 1470 ms)。
+    // 需要旧的 f32 行为时设 GSV_AR_KV_F32=1 (或 GSV_AR_KV_F16=0)。
+    {
+        const char * kvf32 = getenv("GSV_AR_KV_F32");
+        const char * kvf16 = getenv("GSV_AR_KV_F16");
+        s.kv_f16 = !(kvf32 && *kvf32 && strcmp(kvf32, "0") != 0)
+                   && !(kvf16 && *kvf16 && strcmp(kvf16, "0") == 0);
+    }
     // 融合算子支持探测: 用代表性形状建一次节点问后端 (CPU 恒支持; Vulkan 需 shader 在册)
     {
         ggml_init_params fp = { ggml_tensor_overhead() * 32, NULL, true };
