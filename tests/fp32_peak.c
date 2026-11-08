@@ -22,6 +22,7 @@
 //   ./fp32_peak            # runs the self-controls, then 1..4 threads
 #include <immintrin.h>
 #include <omp.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <x86intrin.h>
