@@ -92,6 +92,20 @@ cmake -S llama.cpp -B llama.cpp/build-cpu-rel \
   #     AVX-512 build: mul_mat GEMV  1.73 GMAC/s   conv_1d  1.33 GMAC/s
   # End to end that turned a 1.7 s decode into 43.6 s and RTF 0.23 into 6.41. The documented
   # flags are the fast ones; GGML_NATIVE=ON is a trap on this hardware.
+  #
+  # Mechanism, narrowed with perf (not guessed): the slow build executes 115.9 G instructions for
+  # the same work the fast build does in 10.6 G, at the SAME 3.06 GHz core clock - so it is code
+  # generation, not frequency. Both builds are vectorised and both use zmm; the hot loop of
+  # ggml_vec_dot_f16 in the -march=native build spills its accumulators and round-trips through
+  # memory every iteration (perf annotate: vmovaps -0x670(%rbp),%zmm0 -> kmovw -0x814(%rbp),%k1 ->
+  # vcvtph2ps %ymm1,%zmm0{%k1} -> vmovaps %zmm0,(%rax) -> vmovaps (%rax),%zmm0), i.e. one masked
+  # 16-element block at a time with the mask reloaded from the stack, 343 instructions and 7 calls
+  # in the function. The fast build's version of the same symbol is 68 instructions, 4 vfmadd,
+  # 19 zmm, no calls. Ruled out along the way: the AVX-512 kernels themselves (GGML_NATIVE=OFF +
+  # GGML_AVX512=ON is fast), -mtune=znver4 (fast), missing F16C (both builds emit vcvtps2ph), and
+  # any source-level branch difference (preprocessed output is identical apart from the usual
+  # immintrin.h #pragma GCC target boilerplate). It is a gcc 13 register-allocation/unrolling cliff
+  # for this function when tuned for znver4.
   -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
   -DGGML_BUILD_TESTS=OFF -DLLAMA_BUILD_TESTS=OFF \
   -DCMAKE_BUILD_TYPE=Release
