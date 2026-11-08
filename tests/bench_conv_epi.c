@@ -153,6 +153,37 @@ static void pack(struct conv * c) {
     }
 }
 
+// 出厂（未打补丁）的激活语义，逐字符照抄 ops.cpp 的那一行。
+// slope < 0 表示 tanh —— dec.conv_post 传的就是 -1.0f。
+// 曾经这里被我写成纯 leaky，于是 tanh 变成“半波整流”，整条 wav 与参考不相关：
+// cos 0.14 / max_abs 0.93 / 能量包络不变 / FFT 峰值落到 DC。bench 当时没有 slope<0
+// 的行，所以一路绿着过。
+static inline float act_ship(float v, int has_act, float slope) {
+    if (!has_act) return v;
+    return slope < 0.f ? tanhf(v) : (v > 0.f ? v : 0.f) + slope * (v < 0.f ? v : 0.f);
+}
+
+// 独立的第三个实现：直接用模型张量 w/x（完全不碰 Wt/Xp 打包），double 累加。
+// 它与 V0/V2 无关，所以能抓住“两个变体一起错”的情况（tanh 那次就是一起错的）。
+// 只写 oc < OC 的有效行，布局 [oc][OL]。
+static void reference(const struct conv * c, float * o) {
+    const long IC = c->IC, OC = c->OC, K = c->K, dil = c->dil, T = c->T, OL = c->OL, pad = c->pad;
+    for (long oc = 0; oc < OC; oc++)
+        for (long t = 0; t < OL; t++) {
+            double acc = c->has_bias ? (double) c->b[oc] : 0.0;
+            for (long ic = 0; ic < IC; ic++)
+                for (long k = 0; k < K; k++) {
+                    const long xi = t + k * dil - pad;      // 越界 == conv 的 zero pad
+                    if (xi < 0 || xi >= T) continue;
+                    acc += (double) c->w[(oc * IC + ic) * K + k] * (double) c->x[ic * T + xi];
+                }
+            float v = (float) acc;
+            if (c->has_res) v = v + c->r[oc * OL + t];
+            v = act_ship(v, c->has_act, c->slope);
+            o[oc * OL + t] = v;
+        }
+}
+
 // phase 2（单线程版，含 TSB/OSB 分块）
 static void compute(struct conv * c, float * o_data, int variant) {
     const long IC = c->IC, OC = c->OC, K = c->K, dil = c->dil, OL = c->OL;
@@ -181,12 +212,12 @@ static void compute(struct conv * c, float * o_data, int variant) {
                     if (t0 + TB > OL) {   // 尾巴：标量（每次调用最多一个）
                         for (int64_t t = t0; t < OL; ++t)
                             for (int64_t oc = oc0; oc < (oc0 + 16 < OC ? oc0 + 16 : OC); ++oc) {
-                                float acc = has_bias ? bp[oc] : 0.0f;
+                                float acc = has_bias ? bp[oc] : 0.0f;   // 标量尾巴
                                 for (int64_t ic = 0; ic < IC; ++ic)
                                     for (int64_t kw = 0; kw < K; ++kw)
                                         acc += Wt[(ic * K + kw) * OCp + oc] * Xp[ic * L + t + kw * dil];
                                 if (has_res) acc += c->r[oc * OL + t];
-                                if (has_act) acc = (acc > 0.f ? acc : 0.f) + slope * (acc < 0.f ? acc : 0.f);
+                                acc = act_ship(acc, has_act, slope);
                                 o_data[oc * OL + t] = acc;
                             }
                         continue;
@@ -238,7 +269,7 @@ static void compute(struct conv * c, float * o_data, int variant) {
                             for (int64_t i = 0; i < TB; ++i) {
                                 float v = bv + tmp[i][ch];
                                 if (has_res) v += c->r[oc * OL + t0 + i];
-                                if (has_act) v = (v > 0.f ? v : 0.f) + slope * (v < 0.f ? v : 0.f);
+                                v = act_ship(v, has_act, slope);
                                 o_data[oc * OL + t0 + i] = v;
                             }
                         }
@@ -274,8 +305,28 @@ static void compute(struct conv * c, float * o_data, int variant) {
                             for (int64_t i = 0; i < TB; ++i) {
                                 float v = bv + tmp[i][j];
                                 if (has_res) v += r[i];
-                                if (has_act) v = (v > 0.f ? v : 0.f) + slope * (v < 0.f ? v : 0.f);
+                                v = act_ship(v, has_act, slope);
                                 o[i] = v;
+                            }
+                        }
+                    } else if (has_act && slope < 0.f) {
+                        // V2 的 tanh 分支：与补丁里一模一样的标量回退（tanhf 没有便宜的
+                        // AVX2 形式）。这一支必须存在，否则 conv_post 的 tanh 会被漏掉。
+                        float tmp[TB][16];
+                        _mm256_storeu_ps(&tmp[0][0], a00); _mm256_storeu_ps(&tmp[0][8], a01);
+                        _mm256_storeu_ps(&tmp[1][0], a10); _mm256_storeu_ps(&tmp[1][8], a11);
+                        _mm256_storeu_ps(&tmp[2][0], a20); _mm256_storeu_ps(&tmp[2][8], a21);
+                        _mm256_storeu_ps(&tmp[3][0], a30); _mm256_storeu_ps(&tmp[3][8], a31);
+                        _mm256_storeu_ps(&tmp[4][0], a40); _mm256_storeu_ps(&tmp[4][8], a41);
+                        _mm256_storeu_ps(&tmp[5][0], a50); _mm256_storeu_ps(&tmp[5][8], a51);
+                        for (int64_t j = 0; j < nvalid; ++j) {
+                            const int64_t oc = oc0 + j;
+                            const float bv = has_bias ? bp[oc] : 0.0f;
+                            float * o = o_data + oc * OL + t0;
+                            for (int64_t i = 0; i < TB; ++i) {
+                                float v = bv + tmp[i][j];
+                                if (has_res) v += c->r[oc * OL + t0 + i];
+                                o[i] = act_ship(v, has_act, slope);
                             }
                         }
                     } else {
@@ -321,10 +372,11 @@ static void compute(struct conv * c, float * o_data, int variant) {
 struct shape { const char * name; long IC, OC, K, dil, T; };
 
 static void run_one(const struct shape * s, int has_act, int has_res, int verify_only,
-                    double peak) {
+                    double peak, float slope, int has_bias, long dil_ov) {
     struct conv c;
     memset(&c, 0, sizeof c);
-    const long dil = has_res ? 1 : s->dil;        // conv2 的 dil 恒为 1
+    // dil_ov > 0 时强制 dilation（用来盖住 res + dil>1 这种 op 支持但引擎不用的组合）
+    const long dil = dil_ov > 0 ? dil_ov : (has_res ? 1 : s->dil);
     const long pad = (s->K - 1) / 2 * dil;         // 输出长度 = 输入长度
     c.IC = s->IC; c.OC = s->OC; c.K = s->K; c.dil = dil; c.T = s->T;
     c.pad = pad;
@@ -332,7 +384,7 @@ static void run_one(const struct shape * s, int has_act, int has_res, int verify
     c.OCp = ((s->OC + 15) / 16) * 16;
     c.KP = s->IC * s->K;
     c.L = s->T + 2 * pad;
-    c.has_bias = 1; c.has_act = has_act; c.has_res = has_res; c.slope = 0.1f;
+    c.has_bias = has_bias; c.has_act = has_act; c.has_res = has_res; c.slope = slope;
     c.Wt = xalloc((size_t) (c.KP * c.OCp + c.OCp + c.IC * c.L) * sizeof(float));
     c.bp = c.Wt + c.KP * c.OCp;
     c.Xp = c.bp + c.OCp;
@@ -356,14 +408,38 @@ static void run_one(const struct shape * s, int has_act, int has_res, int verify
         compute(&c, O, 0);
         float * ref = xalloc((size_t) c.OL * c.OCp * sizeof(float));
         memcpy(ref, O, (size_t) c.OL * c.OCp * sizeof(float));
+
+        // (A) 独立校验：出厂的 V0 vs 朴素参考（不经 Wt/Xp 打包、double 累加）。
+        //     变体互比只能抓到“与 V0 不一致”，这一项才能抓到“V0 本身算错”（tanh 那次）。
+        {
+            const size_t nv = (size_t) c.OL * c.OC;
+            float * naive = xalloc(nv * sizeof(float));
+            reference(&c, naive);
+            double rel = 0.0, amax = 1.0;
+            size_t at = 0;
+            for (size_t i = 0; i < nv; i++) if (fabsf(ref[i]) > amax) amax = fabsf(ref[i]);
+            for (size_t i = 0; i < nv; i++) {
+                const double d = fabs((double) naive[i] - (double) ref[i]) / amax;
+                if (d > rel) { rel = d; at = i; }
+            }
+            printf("    %-38s act=%d(slope%+.2f) bias=%d res=%d dil=%ld | V0 vs naive ref: %.2e %s\n",
+                   s->name, has_act, slope, has_bias, has_res, dil, rel,
+                   rel < 1e-4 ? "ok" : "*** WRONG ***");
+            if (rel >= 1e-4)
+                printf("      at oc=%zu t=%zu ref=%.9g naive=%.9g\n", at / (size_t) c.OL,
+                       at % (size_t) c.OL, ref[at], naive[at]);
+            free(naive);
+            if (rel >= 1e-4) exit(2);
+        }
+
         for (int v = 1; v <= 3; v++) {
             memset(O, 0, (size_t) c.OL * c.OCp * sizeof(float));
             compute(&c, O, v);
             const size_t n = (size_t) c.OL * c.OCp;
             size_t bad = n;
             for (size_t i = 0; i < n; i++) if (memcmp(&ref[i], &O[i], 4)) { bad = i; break; }
-            printf("    %-38s act=%d res=%d  V%d vs V0: %s", s->name, has_act, has_res, v,
-                   bad == n ? "bit-identical" : "*** MISMATCH ***");
+            printf("    %-38s act=%d(slope%+.2f) bias=%d res=%d  V%d vs V0: %s", s->name, has_act,
+                   slope, has_bias, has_res, v, bad == n ? "bit-identical" : "*** MISMATCH ***");
             if (bad != n) {
                 const size_t oc = bad / (size_t) c.OL, t = bad % (size_t) c.OL;
                 printf("  first diff at oc=%zu t=%zu: ref=%.9g got=%.9g (n_diff_rows oc0=%zu t0=%zu)",
@@ -436,22 +512,38 @@ int main(int argc, char ** argv) {
         // 小形状：本地（仿真）就能跑完，但把代码路径都盖到：
         //   T 非 6 的倍数/整倍数、OC 不是 16 的倍数（部分 oc 块）、OCp>OC、尾瓦片标量路径
         const struct shape vsh[] = {
-            { "small/tail",  16, 16,  3, 1,  37 },
-            { "small/exact", 16, 16,  3, 1,  12 },
-            { "small/oc24",   8, 24,  7, 3,  13 },
-            { "small/k11",   32, 32, 11, 5,  61 },
+            { "small/tail",   16, 16,  3, 1,  37 },   // T 非 6 倍数 → 尾瓦片
+            { "small/exact",  16, 16,  3, 1,  12 },   // T 恰为 6 的倍数
+            { "small/oc24",    8, 24,  7, 3,  13 },   // OC 不是 16 的倍数
+            { "small/ic8",     8,  8,  3, 1,  37 },   // IC < 16
+            { "small/ic16",   16, 16,  7, 3,  37 },   // IC = 16（stage4）
+            { "small/ic32",   32, 32, 11, 5,  61 },   // IC = 32（stage3）
+            { "small/post",   32,  1,  7, 1,  37 },   // conv_post：OC = 1，只 1 个有效 channel
         };
-        printf("bit-exactness of epilogue variants vs the current one:\n");
-        for (size_t i = 0; i < sizeof vsh / sizeof vsh[0]; i++) {
-            run_one(&vsh[i], 1, 0, 1, peak);
-            run_one(&vsh[i], 0, 1, 1, peak);
-        }
+        const int nvsh = (int) (sizeof vsh / sizeof vsh[0]);
+        // 激活三态 × bias 两态 × res 两态：这张表就是当初缺的那几行。
+        //   slope  0 = 无激活,  +0.1 = leaky_relu（resblock）,  -1 = tanh（conv_post）
+        const int   acts[] = { 0, 1, 1 };
+        const float sls[]  = { 0.0f, 0.1f, -1.0f };
+        int ncombo = 0;
+        printf("=== bit-exactness: V1/V2/V3 vs shipped V0, plus V0 vs an independent naive reference\n");
+        for (int si = 0; si < nvsh; si++)
+            for (int a = 0; a < 3; a++)
+                for (int b = 0; b < 2; b++)
+                    for (int r = 0; r < 2; r++) {
+                        run_one(&vsh[si], acts[a], r, 1, peak, sls[a], b, 0);
+                        ncombo++;
+                    }
+        // op 支持但引擎不用：residual + dilation > 1
+        run_one(&vsh[3], 1, 1, 1, peak, 0.1f, 1, 3); ncombo++;
+        run_one(&vsh[5], 1, 1, 1, peak, 0.1f, 1, 5); ncombo++;
+        printf("=== %d combinations, all bit-identical + all within 1e-4 of the naive reference\n", ncombo);
         return 0;
     }
     const int n = quick ? 2 : (int) (sizeof shapes / sizeof shapes[0]);
     for (int i = 0; i < n; i++) {
-        run_one(&shapes[i], 1, 0, 0, peak);   // conv1：bias + leaky
-        run_one(&shapes[i], 0, 1, 0, peak);   // conv2：bias + residual
+        run_one(&shapes[i], 1, 0, 0, peak, 0.1f, 1, 0);   // conv1：bias + leaky
+        run_one(&shapes[i], 0, 1, 0, peak, 0.1f, 1, 0);   // conv2：bias + residual
     }
     return 0;
 }
