@@ -7,6 +7,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
+#include "ggml-quants.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -70,6 +71,38 @@ int main(void) {
         double dt = now_s() - t0;
         const double macs = (double) IC * K * OC * T * reps;
         printf("conv_1d 128/11/128/T=4120: %.2f ms/call  %.2f GMAC/s\n",
+               dt / reps * 1e3, macs / dt / 1e9);
+        ggml_gallocr_free(ga); ggml_backend_buffer_free(b); ggml_free(ctx);
+    }
+
+    // ---- (c) q8_0 GEMV: what the AR actually runs (weights q8_0, activations converted) ----
+    {
+        const int K = 512, N = 2048;
+        struct ggml_init_params ip = { ggml_tensor_overhead() * 512 + ggml_graph_overhead(), NULL, true };
+        struct ggml_context * ctx = ggml_init(ip);
+        struct ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, N);
+        struct ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 1);
+        struct ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+        ggml_set_input(w); ggml_set_input(x); ggml_set_output(y);
+        ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors(ctx, be);
+        // fill the weights with something, quantised to q8_0
+        {
+            float * src = (float *) malloc(sizeof(float) * K * N);
+            for (int i = 0; i < K * N; i++) src[i] = (float) ((i * 37 % 97) - 48) / 48.0f;
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, src, (void *) w->data, 0, N, K, NULL);
+            free(src);
+        }
+        struct ggml_cgraph * g = ggml_new_graph(ctx);
+        ggml_build_forward_expand(g, y);
+        ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+        ggml_gallocr_alloc_graph(ga, g);
+        ggml_backend_graph_compute(be, g);
+        const int reps = 200;
+        double t0 = now_s();
+        for (int i = 0; i < reps; i++) ggml_backend_graph_compute(be, g);
+        double dt = now_s() - t0;
+        const double macs = (double) K * N * reps;
+        printf("mul_mat q8_0 512x2048 (AR GEMV): %.3f ms/call  %.2f GMAC/s\n",
                dt / reps * 1e3, macs / dt / 1e9);
         ggml_gallocr_free(ga); ggml_backend_buffer_free(b); ggml_free(ctx);
     }

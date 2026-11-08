@@ -233,3 +233,27 @@ Reference audio must be 3–10 s (max 30 s) and readable by the process.
 | `reference audio too long` | trim the clip to 3–10 s |
 | Windows: missing `ggml-*.dll` | copy them next to `gsv_server.exe` (or add to `PATH`) |
 | Linux binary: `GLIBC_2.38 not found` | build on the oldest distro you need (CI uses Ubuntu 22.04) |
+
+## Measured: what q8 and VNNI are worth on a Zen4 box (single core, 1 thread)
+
+`tests/bench_ggml_min.c` on the EPYC 9754 VM, four ggml builds of the same source:
+
+| ggml build | mul_mat f32 GEMV | mul_mat **q8_0** GEMV | conv_1d (im2col) |
+|---|---|---|---|
+| AVX2 (documented flags) | 15.25 GMAC/s | **19.82 GMAC/s** | **13.72 GMAC/s** |
+| AVX-512, no VNNI | 15.80 | — | 10.09 |
+| AVX-512 + AVX512_VNNI | 18.67 | **20.74 GMAC/s** | 10.08 |
+| -DGGML_NATIVE=ON | 1.73 | — | 1.33 |
+
+Reading it:
+* **q8_0 over f32 is +30%** (15.25 -> 19.82) and that is where the AR already lives (`gsv-ar-v2-q8.gguf`).
+  The AR is weight-stream bound (84.5 MB per token), so this is a bandwidth win, not an arithmetic one.
+* **AVX512_VNNI adds only +4.6% on top of AVX2** for q8_0 (19.82 -> 20.74). The int8 headroom that
+  VNNI advertises is not available for these shapes, which is consistent with the earlier finding that
+  the dec conv is FMA/L1-bound rather than dot-product-bound. It does not justify rewriting the dec
+  conv for int8.
+* **AVX-512 costs the conv 26%** (13.72 -> 10.08) while the AR gains ~5%. The dec dominates the
+  pipeline (5.18 s vs 2.68 s AR), so on this hardware the **AVX2 build is the fastest overall
+  configuration** - shipping AVX-512 would be a net loss.
+* `GGML_AVX_VNNI=ON` (VEX-encoded AVX-VNNI) **crashes with SIGILL on this CPU**: it advertises
+  `avx512_vnni` but not `avx_vnni`. Use `GGML_AVX512_VNNI=ON` with `GGML_AVX_VNNI=OFF`.
