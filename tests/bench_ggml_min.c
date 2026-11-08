@@ -27,7 +27,7 @@ int main(void) {
 
     // ---- (a) GEMV: mul_mat [2048 x 512] x [512]  (the AR's ffn2 shape) ----
     {
-        struct ggml_init_params ip = { ggml_tensor_overhead() * 64, NULL, true };
+        struct ggml_init_params ip = { ggml_tensor_overhead() * 512 + ggml_graph_overhead(), NULL, true };
         struct ggml_context * ctx = ggml_init(ip);
         struct ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, 2048);
         struct ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, 1);
@@ -52,7 +52,7 @@ int main(void) {
     // ---- (b) conv: [IC=128, K=11] over T=4120, OC=128 (dec stage1 shape) ----
     {
         const int IC = 128, K = 11, OC = 128, T = 4120;
-        struct ggml_init_params ip = { ggml_tensor_overhead() * 64, NULL, true };
+        struct ggml_init_params ip = { ggml_tensor_overhead() * 512 + ggml_graph_overhead(), NULL, true };
         struct ggml_context * ctx = ggml_init(ip);
         struct ggml_tensor * wt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, IC, OC);
         struct ggml_tensor * xt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, IC);
