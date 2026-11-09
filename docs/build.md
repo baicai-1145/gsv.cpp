@@ -426,3 +426,32 @@ segment prefill only its own target. That turns the per-segment `O(Pp^2)` attent
 Also tested and rejected on this CPU: `GGML_AVX_VNNI=ON` builds fine (149 `vpdpbusd` in the library) but
 dies with SIGILL - this EPYC exposes `avx512_vnni` (EVEX) and not `avx_vnni` (VEX). `GGML_AVX512=ON` is
 1.9x slower for the AR decode (12.71 vs 6.71 ms/step), the same verdict as for the vocoder convolutions.
+
+### Feeding a batch as GEMM columns (decode, B >= 2)
+
+`run_decode` built its activation as `[D, 1, B]`, so `ne11` (the column count ggml hands to
+`llamafile_sgemm`) was 1 while the batch sat in `ne12`. `sgemm` is called per `(i12, i13)` with `n = ne11`,
+so B sequences meant B separate single-column GEMV calls, each sweeping the whole weight matrix. That is
+why batching used to do nothing at all.
+
+`mm_batch()` now views the same memory as `[D, B]` before the five per-layer matmuls and the predict
+matmul (the reshape is a pure view, and the result is reshaped back, so no other op changes):
+
+| | before | after |
+|---|---|---|
+| `n` handed to sgemm | 1 | **8** |
+| kernel | single-column GEMV | `gemm4xN<2>` (4 rows x 2 cols) |
+| matmul throughput | 11.2 GMAC/s | **24 GMAC/s** |
+| decode step, B=8 | 44.8 ms | **38.6 ms** |
+
+The sampled token stream is identical (md5 of 120 tokens at B=4), because only the loop order inside the
+dot products changes.
+
+Two things cap this: AVX2 has 16 vector registers, so `mnpack` in `sgemm.cpp` can only pick 4x2 on AVX2
+(`case 0x44/0x43/0x42 -> nc = 2`); the 4x4 tiling needs `VECTOR_REGISTERS == 32`, i.e. AVX-512. And the
+win on the whole step is limited to 1.16x by Amdahl: attention is 13% of the batched step and is per
+sequence (B x KV traffic, cannot be amortised), plus a few percent of elementwise ops.
+
+So on AVX2 the batched matmul now sits at 24 GMAC/s against a ~23 GMAC/s ceiling for that kernel. Single
+sequence (B=1) is unchanged at 6.87 ms/step - it still gets the single-column GEMV, and that path has no
+remaining headroom on this CPU.

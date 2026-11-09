@@ -61,6 +61,21 @@ struct ar_cache {
     }
 };
 
+// decode 的激活张量是 [D, 1, B]: ne11=1、ne12=B。ggml 的 mul_mat 里列数取的是 ne11，于是
+// llamafile_sgemm 会对每个 i12(即每条序列) 单独调用一次, 每次 n=1 —— 走单列 GEMV,
+// 一次只把权重行摊到 1 次乘加上。B 条序列就是 B 次全量权重扫描, 指令数乘 B,
+// 而这条路径已经是指令发射受限, 所以合批算不岀任何收益 (实测 B=8 = 8 x B=1)。
+//
+// 把同一块内存直接看成 [D, B] 就是另一回事: 批量维变成列数 ne11=B, 一次调用内
+// gemm4xN 把 4 行权重摊到 B 列上, 每指令 MAC 数从 4.7 提到 ~10 (prefill 用 251 列时
+// 实测 27 GMAC/s, 而单列 decode 只有 11.2 GMAC/s)。reshape 是纯视图, 不搬数据。
+static inline ggml_tensor * mm_batch(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x) {
+    if (x->ne[1] != 1 || x->ne[2] < 2 || !ggml_is_contiguous(x)) return ggml_mul_mat(ctx, w, x);
+    ggml_tensor * x2 = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1] * x->ne[2]);
+    ggml_tensor * y  = ggml_mul_mat(ctx, w, x2);
+    return ggml_reshape_3d(ctx, y, y->ne[0], 1, x->ne[2]);
+}
+
 struct gsv_ar::impl {
     // hparams
     int D = 512, NH = 16, HD = 32, NL = 24, VOCAB = 1025, EOS = 1024, PHONES_VOCAB = 732, BERT_DIM = 1024;
@@ -244,7 +259,7 @@ struct gsv_ar::impl {
         ggml_tensor * cur = ggml_add(ctx, x, ggml_mul_mat(ctx, bert_aug, feat));
         std::vector<ggml_tensor *> kout(NL), vout(NL);
         for (int li = 0; li < NL; li++) {
-            ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].qkv_w, cur), ws[li].qkv_b);
+            ggml_tensor * qkv = ggml_add(ctx, mm_batch(ctx, ws[li].qkv_w, cur), ws[li].qkv_b);
             ggml_tensor * qkv4 = ggml_reshape_4d(ctx, qkv, D, 3, S, B);
             // 视图直送 (省每层 6 次 cont): qkv 行内序是 (hd, nh), S 维步长 = 12D
             // -> (HD,NH,S,B) 视图再 permute(0,2,1,3) 即 flash 布局 (S>1 时真正的转置由
@@ -260,13 +275,13 @@ struct gsv_ar::impl {
             ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, qh, kh, vh, mask16, 1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
             attn_out = ggml_reshape_4d(ctx, attn_out, D, S, B, 1);
             attn_out = ggml_reshape_3d(ctx, attn_out, D, S, B);
-            ggml_tensor * o = ggml_mul_mat(ctx, ws[li].out_w, attn_out);
+            ggml_tensor * o = mm_batch(ctx, ws[li].out_w, attn_out);
             ggml_tensor * n1 = ln_affine(ctx, cur, o, ws[li].out_b, ln_pack[2*li+0].wb, ln_pack[2*li+0].n, 1e-5f);
-            ggml_tensor * h = add_act(ctx, ggml_mul_mat(ctx, ws[li].f1w, n1), ws[li].f1b, GGML_ACT_RELU);
-            h = ggml_mul_mat(ctx, ws[li].f2w, h);
+            ggml_tensor * h = add_act(ctx, mm_batch(ctx, ws[li].f1w, n1), ws[li].f1b, GGML_ACT_RELU);
+            h = mm_batch(ctx, ws[li].f2w, h);
             cur = ln_affine(ctx, n1, h, ws[li].f2b, ln_pack[2*li+1].wb, ln_pack[2*li+1].n, 1e-5f);
         }
-        ggml_tensor * logits = ggml_mul_mat(ctx, predict, cur);
+        ggml_tensor * logits = mm_batch(ctx, predict, cur);
         ggml_tensor * last_view = ggml_view_3d(ctx, logits, VOCAB, 1, B, logits->nb[1], logits->nb[2], (int64_t)(S - 1) * logits->nb[1]);
         ggml_tensor * last = ggml_cont(ctx, last_view);   // tensor_get 是裸 memcpy, 需连续
         ggml_set_output(last);
@@ -316,7 +331,7 @@ struct gsv_ar::impl {
         ggml_tensor * cur = x;
         std::vector<ggml_tensor *> writes;   // KV cpy 副作用根 (必须先于 flash 执行)
         for (int li = 0; li < NL; li++) {
-            ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].qkv_w, cur), ws[li].qkv_b);
+            ggml_tensor * qkv = ggml_add(ctx, mm_batch(ctx, ws[li].qkv_w, cur), ws[li].qkv_b);
             ggml_tensor * qkv4 = ggml_reshape_4d(ctx, qkv, D, 3, 1, B);
             // S=1: q/k/v 在 qkv 里的内存序已是 (hd, nh)，可直接用 (HD,1,NH,B) 视图送 flash / 送 KV cpy
             // —— 省掉每层 6 次 ggml_cont (3 次切 q/k/v + 3 次 permute)，数值完全相同
@@ -333,13 +348,13 @@ struct gsv_ar::impl {
             ggml_tensor * vfull = v_view(ctx, li, cache.len + 1);
             ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, qh, kfull, vfull, mask, 1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
             attn_out = ggml_reshape_3d(ctx, attn_out, D, 1, B);
-            ggml_tensor * o = ggml_mul_mat(ctx, ws[li].out_w, attn_out);
+            ggml_tensor * o = mm_batch(ctx, ws[li].out_w, attn_out);
             ggml_tensor * n1 = ln_affine(ctx, cur, o, ws[li].out_b, ln_pack[2*li+0].wb, ln_pack[2*li+0].n, 1e-5f);
-            ggml_tensor * h = add_act(ctx, ggml_mul_mat(ctx, ws[li].f1w, n1), ws[li].f1b, GGML_ACT_RELU);
-            h = ggml_mul_mat(ctx, ws[li].f2w, h);
+            ggml_tensor * h = add_act(ctx, mm_batch(ctx, ws[li].f1w, n1), ws[li].f1b, GGML_ACT_RELU);
+            h = mm_batch(ctx, ws[li].f2w, h);
             cur = ln_affine(ctx, n1, h, ws[li].f2b, ln_pack[2*li+1].wb, ln_pack[2*li+1].n, 1e-5f);
         }
-        ggml_tensor * logits = ggml_mul_mat(ctx, predict, cur);
+        ggml_tensor * logits = mm_batch(ctx, predict, cur);
         ggml_set_output(logits);
         ggml_cgraph * graph = ggml_new_graph_custom(ctx, 4096, false);
         for (ggml_tensor * w : writes) ggml_build_forward_expand(graph, w);   // 先写 KV (副作用根)
@@ -392,7 +407,7 @@ struct gsv_ar::impl {
         ggml_tensor * cur = dgs.x;
         std::vector<ggml_tensor *> writes;
         for (int li = 0; li < NL; li++) {
-            ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].qkv_w, cur), ws[li].qkv_b);
+            ggml_tensor * qkv = ggml_add(ctx, mm_batch(ctx, ws[li].qkv_w, cur), ws[li].qkv_b);
             ggml_tensor * qkv4 = ggml_reshape_4d(ctx, qkv, D, 3, 1, B);
             ggml_tensor * qh   = ggml_view_4d(ctx, qkv4, HD, 1, NH, B, 4 * HD, 4 * HD, qkv4->nb[3], 0);
             ggml_tensor * ksrc = ggml_view_4d(ctx, qkv4, HD, 1, NH, B, 4 * HD, 4 * HD, qkv4->nb[3], qkv4->nb[1]);
@@ -405,13 +420,13 @@ struct gsv_ar::impl {
             ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, qh, kfull, vfull, dgs.mask,
                                                         1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
             attn_out = ggml_reshape_3d(ctx, attn_out, D, 1, B);
-            ggml_tensor * o = ggml_mul_mat(ctx, ws[li].out_w, attn_out);
+            ggml_tensor * o = mm_batch(ctx, ws[li].out_w, attn_out);
             ggml_tensor * n1 = ln_affine(ctx, cur, o, ws[li].out_b, ln_pack[2*li+0].wb, ln_pack[2*li+0].n, 1e-5f);
-            ggml_tensor * h = add_act(ctx, ggml_mul_mat(ctx, ws[li].f1w, n1), ws[li].f1b, GGML_ACT_RELU);
-            h = ggml_mul_mat(ctx, ws[li].f2w, h);
+            ggml_tensor * h = add_act(ctx, mm_batch(ctx, ws[li].f1w, n1), ws[li].f1b, GGML_ACT_RELU);
+            h = mm_batch(ctx, ws[li].f2w, h);
             cur = ln_affine(ctx, n1, h, ws[li].f2b, ln_pack[2*li+1].wb, ln_pack[2*li+1].n, 1e-5f);
         }
-        dgs.logits = ggml_mul_mat(ctx, predict, cur);
+        dgs.logits = mm_batch(ctx, predict, cur);
         ggml_set_output(dgs.logits);
         dgs.graph = ggml_new_graph_custom(ctx, 4096, false);
         ggml_build_forward_expand(dgs.graph, dgs.logits);
