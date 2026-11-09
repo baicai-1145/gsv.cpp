@@ -257,3 +257,43 @@ Reading it:
   configuration** - shipping AVX-512 would be a net loss.
 * `GGML_AVX_VNNI=ON` (VEX-encoded AVX-VNNI) **crashes with SIGILL on this CPU**: it advertises
   `avx512_vnni` but not `avx_vnni`. Use `GGML_AVX512_VNNI=ON` with `GGML_AVX_VNNI=OFF`.
+
+## bf16 weights + fp32 accumulation for the dec conv (implemented, measured, not shipped)
+
+Zen4 has `avx512_bf16` (verified by CPUID: `CPUID.7.1.EAX[5]=1`), so `vdpbf16ps` is available:
+two bf16 operands, **fp32 accumulator**, 32 MAC per instruction. `avx512_fp16` is *not* exposed on
+this VM (`CPUID.7.0.EDX[23]=0`), and neither is `avx_vnni` (VEX form) nor `avx_vnni_int8`.
+
+Accuracy probe first (`GSV_BF16_SIM=1`, rounds both the folded weights and the conv activations to
+bf16 while accumulating in fp32 — numerically what `vdpbf16ps` does):
+
+| path | wav cos vs torch | max_abs | rms_diff |
+|---|---|---|---|
+| f32 | 0.999917 | 1.293e-02 | 1.925e-03 |
+| bf16 in / fp32 acc | **0.999763** | 2.783e-02 | 2.409e-03 |
+
+A real kernel was then written (`GSV_BF16_CONV=1`): weights packed as bf16 pairs along the reduction
+axis, im2col materialised as bf16 pairs in `[kp2][t]` layout (8 taps per iteration via
+`vcvtneps2bf16` + `vpunpck*epi16`), and a 6-tap x 16-oc micro-kernel of `vdpbf16ps`. It reproduces
+the simulation's cos to 6 digits (0.999769), so the arithmetic is right. Micro-benchmark of bb16 vs
+f32 GEMV on the same box: 31.0 vs 18.9 GMAC/s (1.67x in cache).
+
+Performance result, however, is a wash:
+
+| config (same binary, threads=2) | dec |
+|---|---|
+| f32 conv | 2568 ms |
+| bf16 conv, scalar im2col | 5669 ms |
+| bf16 conv, vectorised im2col | 2367 ms |
+| bf16 conv, + two oc blocks per broadcast | 2861 ms |
+
+Three things consumed the 2x arithmetic advantage: (a) a materialised im2col buffer, which the tuned
+f32 kernel does not need at all; (b) one `vpbroadcastd` per (tap, t) pair, which perf showed at 66% of
+kernel samples against 8% for `vdpbf16ps` itself; (c) `OCp` rounding 24 -> 32. Merging two oc blocks
+per broadcast made it worse (12 live accumulators cost more than the saved broadcasts).
+
+Method note, learned the hard way twice in this session: the host is a burstable instance whose clock
+oscillates 3.07 -> 1.63..2.04 GHz, so two long runs minutes apart are not comparable; and a buffer
+that was never written reads back as the shared zero page, which inflated one "skip the im2col"
+measurement to a fake 1264 ms. Both f32 large-GEMV bandwidth and that im2col split were artefacts of
+untouched pages. Compare interleaved, on one binary, medians over repeats.
