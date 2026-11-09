@@ -278,7 +278,18 @@ axis, im2col materialised as bf16 pairs in `[kp2][t]` layout (8 taps per iterati
 the simulation's cos to 6 digits (0.999769), so the arithmetic is right. Micro-benchmark of bb16 vs
 f32 GEMV on the same box: 31.0 vs 18.9 GMAC/s (1.67x in cache).
 
-Performance result, however, is a wash:
+The clock-independent comparison (one binary, one thread, back-to-back, same 2.25 GHz after the
+burstable budget ran out - wall clock is useless here, cycles are not):
+
+| config | instructions | cycles | IPC | cos |
+|---|---|---|---|---|
+| f32 conv | 130.02 G | 62.56 G | 2.08 | 0.999917 |
+| bf16 conv | 92.43 G | 53.04 G | 1.74 | 0.999769 |
+
+29% fewer instructions but only 15% fewer cycles, because IPC drops 2.08 -> 1.74: the bf16 kernel is
+denser in memory stalls. Net gain on the dec stage is ~1.2x, not the 2x the arithmetic promised.
+
+Raw wall-clock numbers, same binary, 2 threads, at the 3.07 GHz the box still had at that point:
 
 | config (same binary, threads=2) | dec |
 |---|---|
