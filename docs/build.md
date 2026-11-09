@@ -424,8 +424,21 @@ segment prefill only its own target. That turns the per-segment `O(Pp^2)` attent
 `t * (Pp + t)`.
 
 Also tested and rejected on this CPU: `GGML_AVX_VNNI=ON` builds fine (149 `vpdpbusd` in the library) but
-dies with SIGILL - this EPYC exposes `avx512_vnni` (EVEX) and not `avx_vnni` (VEX). `GGML_AVX512=ON` is
-1.9x slower for the AR decode (12.71 vs 6.71 ms/step), the same verdict as for the vocoder convolutions.
+dies with SIGILL - this EPYC exposes `avx512_vnni` (EVEX) and not `avx_vnni` (VEX).
+
+`GGML_AVX512=ON` is slower at **every** batch size, and the gap does not close once the 4x4 tiling becomes
+reachable. Re-measured after the batch-as-columns change, so AVX-512 really can pick `gemm4xN<4>`
+(`VECTOR_REGISTERS == 32`) while AVX2 is stuck at 4x2:
+
+| B | AVX2 | AVX-512 | |
+|---|---|---|---|
+| 1 | 6.76 ms | 13.02 ms | 1.93x slower |
+| 4 | 21.00 ms | 43.56 ms | 2.07x slower |
+| 8 | 37.87 ms | 84.03 ms | 2.22x slower |
+
+So AVX-512's extra registers do not pay for Zen 4's 512-bit double pumping here; one AVX2 build is the
+right deployment for both single-sequence and batched decode. This is now the third independent workload
+(conv, GEMV decode, blocked GEMM decode) that reaches the same verdict.
 
 ### Feeding a batch as GEMM columns (decode, B >= 2)
 
