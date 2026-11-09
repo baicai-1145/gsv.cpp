@@ -278,26 +278,36 @@ axis, im2col materialised as bf16 pairs in `[kp2][t]` layout (8 taps per iterati
 the simulation's cos to 6 digits (0.999769), so the arithmetic is right. Micro-benchmark of bb16 vs
 f32 GEMV on the same box: 31.0 vs 18.9 GMAC/s (1.67x in cache).
 
-The clock-independent comparison that settles it: one binary, one thread, nothing else running,
-two interleaved pairs (the host had dropped to 2.25 GHz, so wall clock is worthless here; cycles are
-not). perf stat, whole run:
+The clock-independent comparison (one binary, one thread, nothing else running, perf stat over the
+whole run - the host had dropped to 2.25 GHz by then, so wall clock is worthless):
 
-| run | instructions | cycles | IPC |
+| config | instructions | cycles | IPC |
 |---|---|---|---|
-| f32  pair 1 | 129.68 G | 43.638 G | 2.97 |
-| bf16 pair 1 |  92.16 G | 44.388 G | 2.08 |
-| f32  pair 2 | 129.69 G | 43.954 G | 2.95 |
-| bf16 pair 2 |  92.16 G | 44.429 G | 2.07 |
+| f32 conv | 129.74 G | 43.88 G | 2.96 |
+| bf16, oc-outer loop order | 88.19 G | 44.09 G | 2.00 |
+| bf16, t-block-outer | **88.01 G** | **33.86 G** | 2.60 |
 
-**28.9% fewer instructions, 1.4% MORE cycles.** IPC collapses 2.96 -> 2.08, so the instruction saving
-is entirely given back by stalls and the bf16 path ends up marginally slower. That is the verdict: the
-bf16 arithmetic advantage is real (31.0 vs 18.9 GMAC/s in the isolated GEMV) but this convolution is
-not arithmetic-bound - it is bound by one `vdpbf16ps` per cycle on a single execution port plus six
-broadcast loads per reduction step, which the f32 kernel hides behind a 3-wide issue mix.
+**The loop order was the whole story.** With `oc` outer, every oc block re-read the entire im2col
+buffer from DRAM. That buffer is `KPP * OLp * 4` bytes, i.e. **K times the activation**, so the largest
+dec layer (OL=16480, IC=128, OC=128, K=11) moved 46.4 MB * 8 oc blocks = 371 MB against the f32
+kernel's 8.4 MB * 8 = 67 MB - and the f32 kernel needs no im2col at all. Putting the t block outer keeps
+one 12 x KPP x 4 = 34 KB activation tile in L1 and streams the 360 KB weight tile from L2 instead:
+44.09 -> 33.86 G cycles, **1.30x against f32 over the whole run** (about 1.4x on the dec stage alone).
 
-An earlier pair of runs showed 1.18x in favour of bf16; that measurement was taken while a second
-synth process was competing for the same core, which is exactly the kind of contamination the
-interleaved protocol is supposed to catch.
+Two hypotheses were tested and refuted on the way there, which is worth recording because each looked
+convincing:
+
+* "the six accumulators give a reuse distance (6 cycles) shorter than the ~4-6 cycle vdpbf16ps latency,
+  so the single dp port idles". Doubling to **12 accumulators changed cycles by 0.7%** (44.39 -> 44.09 G)
+  and dropped IPC further (2.08 -> 2.00). Not a latency problem.
+* "the burstable clock makes the comparison meaningless". True for wall clock, which is why every number
+  above is instructions/cycles, measured in interleaved pairs on one binary.
+
+The remaining gap to f32's IPC (2.60 vs 2.96) is the per-tap `vpbroadcastd`: perf puts it at 66% of
+kernel samples against 8% for `vdpbf16ps` itself. One broadcast feeds exactly one dpbf16ps today, so the
+fix would be to feed two oc blocks per broadcast - tried earlier and it regressed to 2861 ms on wall
+clock, but that measurement was taken with the oc-outer loop order, so it should be retried now that the
+traffic problem is fixed.
 
 Raw wall-clock numbers, same binary, 2 threads, at the 3.07 GHz the box still had at that point:
 
