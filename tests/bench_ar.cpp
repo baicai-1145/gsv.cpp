@@ -75,12 +75,12 @@ static bool build_from_fixture(const std::string & dir, gsv_ar_request & r) {
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <ar.gguf> [--threads N] [--steps N] [--phones N] [--prompt N]"
-                        " [--fixture DIR] [--seed N] [--tok-out FILE] [--json]\n", argv[0]);
+        fprintf(stderr, "usage: %s <ar.gguf> [--threads N] [--steps N] [--phones N] [--prompt N] [--seqs N]"
+                        " [--fixture DIR] [--seed N] [--tok-out FILE] [--seqs N] [--json]\n", argv[0]);
         return 2;
     }
     const std::string path = argv[1];
-    int threads = 4, steps = 179, n_phones = 40, n_prompt = 32;
+    int threads = 4, steps = 179, n_phones = 40, n_prompt = 32, n_seqs = 1;
     long seed = 12345;
     bool json = false;
     std::string fixture, tok_out;
@@ -92,6 +92,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--fixture") && i + 1 < argc) fixture = argv[++i];
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = atol(argv[++i]);
         else if (!strcmp(argv[i], "--tok-out") && i + 1 < argc) tok_out = argv[++i];
+        else if (!strcmp(argv[i], "--seqs") && i + 1 < argc) n_seqs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--json")) json = true;
         else { fprintf(stderr, "bad arg %s\n", argv[i]); return 2; }
     }
@@ -127,7 +128,8 @@ int main(int argc, char ** argv) {
     const std::vector<int32_t> * orc = real ? nullptr : &oracle;
 
     gsv_sampler_cfg sampler;   // 默认: top_k=15 / top_p=1 / temp=1 / rep=1.35
-    std::vector<gsv_ar_request> reqs = { r };
+    // --seqs N: N 条同形请求一起解码, 用来量批量 AR 的扩展性 (每 token 权重只读一次, 摊给 N 条)
+    std::vector<gsv_ar_request> reqs(n_seqs > 0 ? (size_t) n_seqs : 1, r);
 
     // 预热 (建图/cache 分配/页错误). --warm 0 可关掉, 用于看冷进程首个请求的开销。
     m->generate(reqs, sampler, (uint64_t) seed, -1, 8, orc, nullptr);
@@ -140,6 +142,16 @@ int main(int argc, char ** argv) {
     const int got = res.tokens.empty() ? 0 : (int) res.tokens[0].size() - prefill_tokens;
     const double total = t1 - t0;
     const double per_tok = total / (double) (got > 0 ? got : steps);
+    const int    B      = (int) reqs.size();
+    const double agg_per_tok = per_tok / (double) B;   // 摊到每条序列的有效 ms/token
+    // KV 是 B 倍分配, 峰值 RSS 决定批量上限
+    long rss_kb = 0;
+    if (FILE * f = fopen("/proc/self/status", "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), f))
+            if (!strncmp(line, "VmHWM:", 6)) { rss_kb = atol(line + 6); break; }
+        fclose(f);
+    }
 
     if (real && !res.tokens.empty()) {
         const std::vector<int32_t> & all = res.tokens[0];
@@ -153,12 +165,17 @@ int main(int argc, char ** argv) {
     }
 
     if (json) {
-        printf("{\"gguf\":\"%s\",\"threads\":%d,\"tokens\":%d,\"total_ms\":%.1f,\"ms_per_token\":%.3f,\"tok_per_s\":%.1f}\n",
-               path.c_str(), threads, got, total, per_tok, 1000.0 / per_tok);
+        printf("{\"gguf\":\"%s\",\"threads\":%d,\"seqs\":%d,\"tokens\":%d,\"total_ms\":%.1f,"
+               "\"ms_per_token\":%.3f,\"tok_per_s\":%.1f,\"agg_ms_per_token\":%.3f,"
+               "\"agg_tok_per_s\":%.1f,\"rss_mib\":%.1f}\n",
+               path.c_str(), threads, B, got, total, per_tok, 1000.0 / per_tok,
+               agg_per_tok, 1000.0 / agg_per_tok, rss_kb / 1024.0);
     } else {
         printf("[bench_ar] %s\n", path.c_str());
-        printf("[bench_ar] threads=%d decode_tokens=%d total=%.1f ms  ->  %.3f ms/token  (%.1f tok/s)\n",
-               threads, got, total, per_tok, 1000.0 / per_tok);
+        printf("[bench_ar] threads=%d seqs=%d decode_tokens=%d total=%.1f ms  ->  %.3f ms/token  "
+               "(%.1f tok/s)  |  聚合 %.3f ms/token/seq (%.1f tok/s)  |  RSS 峰值 %.1f MiB\n",
+               threads, B, got, total, per_tok, 1000.0 / per_tok,
+               agg_per_tok, 1000.0 / agg_per_tok, rss_kb / 1024.0);
     }
     delete m;
     return 0;
