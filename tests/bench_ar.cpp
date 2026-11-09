@@ -76,7 +76,7 @@ static bool build_from_fixture(const std::string & dir, gsv_ar_request & r) {
 int main(int argc, char ** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <ar.gguf> [--threads N] [--steps N] [--phones N] [--prompt N] [--seqs N]"
-                        " [--fixture DIR] [--seed N] [--tok-out FILE] [--seqs N] [--json]\n", argv[0]);
+                        " [--fixture DIR] [--seed N] [--tok-out FILE] [--json]\n", argv[0]);
         return 2;
     }
     const std::string path = argv[1];
