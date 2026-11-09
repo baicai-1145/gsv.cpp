@@ -382,8 +382,25 @@ Instruction budget for the non-VNNI q8 GEMV: per 32-weight block it needs one 32
 vpmaddwd, vpaddd and the amortised scale (cvt + fmadd), i.e. ~6 instructions per 32 MAC = 4.7 MAC per
 instruction. At 2.25 GHz that is 12.7 GMAC/s at IPC 1.2 and 15.9 at IPC 1.5, and the measured 11.3 (B=1)
 to 13.6 (B=8) GMAC/s sits at 85-90% of that. So the AR decode is instruction-issue bound and essentially
-saturated - there is no 4x sitting in the loop nest, which is also why reordering the block loops cannot
-help.
+saturated - there is no 4x sitting in the loop nest.
+
+Four independent observations agree with that model, and they were worth getting separately because each
+one on its own is ambiguous:
+
+1. the instruction budget above (85-90% of what the kernel can issue);
+2. SMT scaling of 1.04x - extra SMT threads add issue slots and latency hiding but no bandwidth;
+3. the B scan is linear, i.e. every extra sequence pays a full set of MACs;
+4. `GSV_MM_ROW_OUTER` changes nothing once it is genuinely active. This is the sharpest test because the
+   theory *predicts* a null result: reordering the block loops moves weight bytes from DRAM to L1 but
+   issues exactly the same vpmaddubsw/vpmaddwd/vpaddd, and we are not byte bound. B=8 44.79 -> 45.28
+   ms/step, and the sampled token stream md5 is identical, so the swap is correct but useless.
+
+Caveat for anyone repeating this: the first two attempts at that experiment were invalid. The guard
+started as `ne11 >= 2 && ne12 == 1`, which never matches, because the batch dimension of a 2D weight
+broadcast lives in ne12 (decode is ne11=1, ne12=B); a patch also got lost in a broken heredoc, and the
+token-stream md5 comparison "passed" because both branches were the untouched original. Verify a change
+is live (here: one debug line per (ne11, ne12) showing `swap=1` for both prefill and decode) before
+trusting any measurement of it.
 
 The only way past it is fewer instructions per MAC, i.e. a wider dot: VNNI (`vpdpbusd`, 64 MAC/instr)
 needs the VEX form this EPYC lacks (AVX-512 VNNI exists but that build is 1.9x slower here), and
