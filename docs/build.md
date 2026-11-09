@@ -344,3 +344,40 @@ oscillates 3.07 -> 1.63..2.04 GHz, so two long runs minutes apart are not compar
 that was never written reads back as the shared zero page, which inflated one "skip the im2col"
 measurement to a fake 1264 ms. Both f32 large-GEMV bandwidth and that im2col split were artefacts of
 untouched pages. Compare interleaved, on one binary, medians over repeats.
+
+## AR stage: where the time actually goes (long text)
+
+Measured with `bench_ar --seqs N --fixture ...` on the same box, threads=2, and read off the built-in
+`GSV_AR_PROFILE` report (decode only - `bench_ar`'s `total` includes the prefill, which is what made the
+first batch experiment look useless):
+
+| quantity | value |
+|---|---|
+| decode, B=1 | **6.71 ms/step** (150 MB of q8 weights / 6.7 ms = 22 GB/s, i.e. weight-bandwidth bound) |
+| prefill | **~3.0 ms per position** for S ~ 250 |
+| decode, B=8 | 46.7 ms/step -> 2.1x aggregate, i.e. batching buys almost nothing |
+| prefill, B=8 | 7.6x of B=1 - also nearly linear |
+| AVX-512 build vs AVX2 | decode **1.9x slower** (12.71 vs 6.71 ms/step) - keep the AVX2 build |
+| prefill hotspot (perf) | 67% `tinyBLAS_Q0_AVX<q8_0,q8_0,float>::gemm4xN`, 21% `flash_attn_ext` |
+
+Why batching does not help: batching amortises the *weight* pass, but the rest of the step is attention
+over each sequence's own KV, which is per-sequence and therefore linear in B. At B=8 the weight pass is
+~9 ms while 8 sequences' attention is ~32 ms, so the total stays ~40 ms/step no matter what.
+
+The real cost for long text is the **per-segment fixed price**. `split_text` (non-streaming) used to cut
+every **8 characters**, so a 240-character sentence became ~30 segments, and every segment paid its own
+full prefill of the shared prompt (~1.4 s at S=118) plus a fresh vocoder call. `seg_chars` now makes the
+segment length configurable; the physical ceiling is `early_stop` (400 sem tokens ~ 4.6 tokens/char
+~ 87 characters), and ~60 characters is a safe default for throughput.
+
+The remaining architectural fix (not implemented) is to stop re-prefilling the shared prompt: it is
+identical for every segment (`prm->phones`, `prm->bert`, `ref->codes`), so prefill it once with B=1,
+copy the KV into every sequence slot (8 seqs x 103 positions x 48 KiB = 39 MB, cheap), and let each
+segment prefill only its own target. That turns the per-segment `O(Pp^2)` attention into
+`t * (Pp + t)`.
+
+Also recorded: `GSV_MM_ROW_OUTER` (swapping the block loops in
+`ggml_compute_forward_mul_mat_one_chunk` so a 16-row weight block stays in L1 while every column of the
+batch walks it) is bit-identical - verified by comparing the sampled token stream md5 across the two
+modes - but the win it can deliver is bounded by the weight share of the step, which the numbers above
+put at roughly a quarter at B=8.

@@ -271,8 +271,10 @@ inline int utf8_len(const std::string & s) {
     return n;
 }
 
-inline std::vector<std::string> split_text(const std::string & text, const std::string & method) {
+inline std::vector<std::string> split_text(const std::string & text, const std::string & method,
+                                           size_t target_chars = 8) {
     std::vector<std::string> out;
+    if (target_chars < 1) target_chars = 1;
     if (method.empty() || method == "cut0" || text.empty()) { out.push_back(text); return out; }
 
     std::vector<std::string> raw;
@@ -290,7 +292,7 @@ inline std::vector<std::string> split_text(const std::string & text, const std::
     std::string acc;
     for (const auto & s : raw) {
         acc += s;
-        if (utf8_len(acc) >= 8) { out.push_back(acc); acc.clear(); }
+        if (utf8_len(acc) >= target_chars) { out.push_back(acc); acc.clear(); }
     }
     if (!acc.empty()) {
         if (!out.empty()) out.back() += acc;
@@ -418,6 +420,10 @@ struct SynthParams {
     float cfg = 0.0f;
     int seed = -1;
     int max_steps = 1500, early_stop = 400;
+    // 切段目标字数: 0 = 旧行为 (非流式 8 字/段, 流式 60 字/段)。
+    // 段长上限由 early_stop 决定: 约 4.6 sem token/字, 所以 400 token ≈ 87 字;
+    // 合到 ~60 字可把段数降到 1/7, 省掉每段的 prompt prefill + 图构建 + 权重重读。
+    int seg_chars = 0;
     double speed = 1.0;
     int skip_steps = 0;   // 邪修：跳过 DiT 前 N 步模型调用（v=0）
     // cache-dit：-1 = auto（V5dev 32 步档自动 F8/.12；turbo 4 步自动关）
@@ -885,7 +891,7 @@ inline bool synth_text(State & st, gsv_engine & eng, const SidecarCfg & side, co
     int stage = 0;
     try {
     stage = 1;
-    const auto segs = split_text(p.text, p.split_method);
+    const auto segs = split_text(p.text, p.split_method, p.seg_chars > 0 ? (size_t) p.seg_chars : 8);
     tm.segments = (int) segs.size();
     out.clear();
 
@@ -1075,7 +1081,7 @@ inline bool synth_batch_texts(State & st, const SidecarCfg & side, const SynthPa
     std::vector<BatchUnit> units;
     std::vector<std::vector<size_t>> item_units(n);
     for (size_t i = 0; i < n; i++) {
-        const auto segs = split_text(texts[i], p.split_method);
+        const auto segs = split_text(texts[i], p.split_method, p.seg_chars > 0 ? (size_t) p.seg_chars : 8);
         tms[i].segments = (int) segs.size();
         for (const auto & seg : segs) {
             BatchUnit u;
@@ -1483,7 +1489,7 @@ inline bool synth_segment_q(State & st, const SidecarCfg & side, const SynthPara
 // 整段：ensure_ref(短锁) + 逐 segment
 inline bool synth_text_q(State & st, const SidecarCfg & side, const SynthParams & p,
                          std::vector<float> & out, SynthTiming & tm, std::string & err) {
-    const auto segs = split_text(p.text, p.split_method);
+    const auto segs = split_text(p.text, p.split_method, p.seg_chars > 0 ? (size_t) p.seg_chars : 8);
     tm.segments = (int) segs.size();
     out.clear();
     std::shared_ptr<const RefPrep> ref;
@@ -1507,7 +1513,8 @@ using stream_pcm_fn = std::function<bool(const int16_t * pcm, size_t n)>;
 
 inline bool synth_text_stream_q(State & st, const SidecarCfg & side, const SynthParams & p,
                                 const stream_pcm_fn & sink, SynthTiming & tm, std::string & err) {
-    const auto segs = split_text_stream(p.text, p.split_method);
+    const auto segs = split_text_stream(p.text, p.split_method, 4,
+                                       p.seg_chars > 0 ? (size_t) p.seg_chars : 60);
     tm.segments = (int) segs.size();
     std::shared_ptr<const RefPrep> ref;
     std::shared_ptr<const PromptPrep> prm;
@@ -1570,7 +1577,7 @@ inline bool synth_batch_texts_q(State & st, const SidecarCfg & side, const Synth
     std::vector<std::vector<size_t>> item_units(n);
     std::vector<double> t_g2p(n, 0), t_bert(n, 0), t_ar(n, 0), t_syn(n, 0), t_cond(n, 0), t_voc2(n, 0);
     for (size_t i = 0; i < n; i++) {
-        const auto segs = split_text(texts[i], p.split_method);
+        const auto segs = split_text(texts[i], p.split_method, p.seg_chars > 0 ? (size_t) p.seg_chars : 8);
         tms[i].segments = (int) segs.size();
         for (const auto & seg : segs) {
             BatchUnit u;

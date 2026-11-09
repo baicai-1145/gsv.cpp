@@ -746,7 +746,12 @@ gsv_ar_result gsv_ar::generate(const std::vector<gsv_ar_request> & reqs,
     std::vector<int> pad_len(B, 0);
     for (int b = 0; b < B; b++) pad_len[b] = max_len - (int) reqs[b].phones.size();
 
-    s.alloc_cache(S + max_steps + 8, B);
+    // KV 按“实际可能生成的长度”分配, 不按 max_steps。early_stop 强制在生成 token 数超过它时
+    // 结束 (见下方 idx_list 的强制回收), 所以需要的槽位是 S + early_stop + 常数;
+    // 用 max_steps 会白占好几倍内存, 直接限制批大小 (B 倍线性放大)。
+    int gen_bound = max_steps;
+    if (early_stop_num > 0) gen_bound = std::min(max_steps, early_stop_num + 4);
+    s.alloc_cache(S + gen_bound + 8, B);
     s.cache.len = 0;
     s.run_first(xy, feat, mask, S, lg);
     prof_reset();

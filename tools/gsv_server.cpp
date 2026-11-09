@@ -240,6 +240,7 @@ void parse_params(const json & b, SynthParams & p) {
     p.speed = jnum(b, "speed_factor", 1.0);
     p.skip_steps = (int) jnum(b, "skip_first_step", 0);
     p.split_method = jstr(b, "text_split_method", "cut5");
+    p.seg_chars = (int) jnum(b, "seg_chars", 0);   // 0 = 旧行为; ~60 = 吞吐优先(段数最少)
     p.fragment_interval = (float) jnum(b, "fragment_interval", 0.3);
     p.sampler.top_k = (int) jnum(b, "top_k", p.sampler.top_k);
     p.sampler.top_p = (float) jnum(b, "top_p", p.sampler.top_p);
@@ -1171,7 +1172,7 @@ int main(int argc, char ** argv) {
         static const char * keys[] = {"text", "text_lang", "ref_audio_path", "prompt_text", "prompt_lang",
                                       "voice", "text_split_method", "media_type", "sample_steps", "cfg_rate",
                                       "seed", "top_k", "top_p", "temperature", "repetition_penalty",
-                                      "fragment_interval", "max_steps", "early_stop", "speed_factor", "skip_first_step",
+                                      "fragment_interval", "max_steps", "early_stop", "seg_chars", "speed_factor", "skip_first_step",
                                       "dbcache", "dbcache_fn", "dbcache_threshold", "dbcache_warmup",
                                       "dbcache_downsample", "stream",
                                       "dit_uncond_reuse",
