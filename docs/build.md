@@ -309,6 +309,22 @@ fix would be to feed two oc blocks per broadcast - tried earlier and it regresse
 clock, but that measurement was taken with the oc-outer loop order, so it should be retried now that the
 traffic problem is fixed.
 
+### Result at the deployment configuration (threads=2)
+
+Interleaved pair, one binary, nothing else running, perf stat over the whole run:
+
+| config | dec | whole synth | instructions | cycles | IPC |
+|---|---|---|---|---|---|
+| f32 conv | 2615.8 ms | 5004.8 ms | 129.18 G | 76.54 G | 1.69 |
+| bf16 conv | **1541.5 ms** | **3076.9 ms** | 87.88 G | 58.42 G | 1.50 |
+
+**1.70x on the dec stage, 1.63x on the whole synthesis**, with the wav cos moving only from 0.999917 to
+0.999769 - i.e. the same audio, 1.6x faster. Enable with `GSV_BF16_CONV=1`; the f32 path stays the
+default until this has been listened to across more voices and both languages.
+
+Historical wall-clock table, kept only to show how misleading it was (same binary, 2 threads, at the
+3.07 GHz the box still had at that point, and all of it measured before the loop order was fixed):
+
 Raw wall-clock numbers, same binary, 2 threads, at the 3.07 GHz the box still had at that point:
 
 | config (same binary, threads=2) | dec |
