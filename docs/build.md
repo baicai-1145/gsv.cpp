@@ -258,7 +258,15 @@ Reading it:
 * `GGML_AVX_VNNI=ON` (VEX-encoded AVX-VNNI) **crashes with SIGILL on this CPU**: it advertises
   `avx512_vnni` but not `avx_vnni`. Use `GGML_AVX512_VNNI=ON` with `GGML_AVX_VNNI=OFF`.
 
-## bf16 weights + fp32 accumulation for the dec conv (implemented, measured, not shipped)
+## bf16 weights + fp32 accumulation for the dec conv (measured, **not in this tree**)
+
+> Status check before relying on anything below: the kernel itself is **absent** from the current
+> source (`rg 'GSV_BF16_CONV|vdpbf16ps' src/ tools/` finds nothing). It was written in a scratch build
+> that has since been deleted, so `GSV_BF16_CONV=1` is a no-op today: the dec measures 2630.4 ms in f32
+> and 2629.8 ms with the flag set, i.e. identical. What survives is this record: the design, the
+> accuracy numbers, and the fact that the loop order was worth more than the arithmetic. Re-implement
+> from here rather than re-deriving it.
+
 
 Zen4 has `avx512_bf16` (verified by CPUID: `CPUID.7.1.EAX[5]=1`), so `vdpbf16ps` is available:
 two bf16 operands, **fp32 accumulator**, 32 MAC per instruction. `avx512_fp16` is *not* exposed on
