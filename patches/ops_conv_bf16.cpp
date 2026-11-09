@@ -23,6 +23,33 @@
 #pragma GCC push_options
 #pragma GCC target("avx512f,avx512vl,avx512bf16,f16c,fma")
 #include <immintrin.h>
+#include <x86intrin.h>
+#include <cstdio>
+#include <cstdlib>
+
+// GSV_DEC_T=1: phase split via rdtsc (TSC counts reference cycles, so these are wall-clock shares).
+static unsigned long long g_dec_t[3] = {0, 0, 0};
+static unsigned long long g_dec_n = 0;
+unsigned long long g_dec_fma = 0;
+static inline void gsv_dec_acc(int slot, unsigned long long d) { g_dec_t[slot] += d; }
+struct gsv_dec_rep {
+    ~gsv_dec_rep() {
+        if (!getenv("GSV_DEC_T") || g_dec_n == 0) return;
+        const double tot = (double) (g_dec_t[0] + g_dec_t[1] + g_dec_t[2]);
+        fprintf(stderr, "[dec-t] layers=%llu pack=%.1f%% im2col=%.1f%% kernel=%.1f%%"
+                        "  fma/layer=%.2f M  kernel_eff=%.1f%%\n",
+                g_dec_n, 100.0 * g_dec_t[0] / tot, 100.0 * g_dec_t[1] / tot,
+                100.0 * g_dec_t[2] / tot,
+                g_dec_fma / (double) g_dec_n / 1e6,
+                100.0 * (g_dec_fma / (double) g_dec_n) * 2.0 / (g_dec_t[2] / (double) g_dec_n));
+    }
+};
+static gsv_dec_rep g_dec_rep_inst;
+struct gsv_dec_kernel_scope {
+    unsigned long long t;
+    explicit gsv_dec_kernel_scope(unsigned long long t0) : t(t0) {}
+    ~gsv_dec_kernel_scope() { gsv_dec_acc(2, __rdtsc() - t); }
+};
 
 static inline uint32_t ggml_f32_to_bf16_bits(float v) {
     uint32_t u;
@@ -51,7 +78,7 @@ bool gsv_conv_direct_1d_bf16(const gsv_conv_bf16_args & args) {
         const int64_t KP  = IC * K;               // reduction length
         const int64_t KPP = (KP + 1) / 2;         // bf16 pairs
         const int64_t OCp = ((OC + 15) / 16) * 16;
-        constexpr int64_t TBZ = 12;               // micro-kernel tap count (compile-time)
+        constexpr int64_t TBZ = 8;                 // micro-kernel tap count (compile-time)
         const int64_t OLp = ((OL + 31) / 32) * 32; // padded tap length (>= OL + TBZ)
 
         char * wbase = (char *) wdata;
@@ -68,6 +95,7 @@ bool gsv_conv_direct_1d_bf16(const gsv_conv_bf16_args & args) {
         const int ith = args.ith;
         const int nth = args.nth;
 
+        const unsigned long long _gt0 = __rdtsc();
         // phase 1a: pack weights along the reduction axis; threads split oc columns
         {
             const int64_t per = (OC + nth - 1) / nth;
@@ -88,6 +116,9 @@ bool gsv_conv_direct_1d_bf16(const gsv_conv_bf16_args & args) {
             for (int64_t oc = b0; oc < b1; ++oc) bp[oc] = (oc < OC && b_data) ? b_data[oc] : 0.0f;
         }
 
+        { const unsigned long long _gt1 = __rdtsc(); gsv_dec_acc(0, _gt1 - _gt0); }
+        const unsigned long long _gt2 = __rdtsc();
+        ++g_dec_n;
         // phase 1b: im2col into bf16 pairs, laid out as Xb[kp2][t] so that a 32-bit pair read
         // for consecutive t is contiguous. Pairing is along the reduction axis (kp, kp+1), so the
         // two streams are each contiguous in t and the whole row converts 8 taps at a time:
@@ -119,15 +150,19 @@ bool gsv_conv_direct_1d_bf16(const gsv_conv_bf16_args & args) {
                 const int64_t off_a = (kp_a % K) * dil - pad;
                 const int64_t off_b = (kp_b % K) * dil - pad;
 
-                // zero the whole row: covers t >= OL, the padded t tail and out-of-range taps
-                for (int64_t t = 0; t < OLp; t += 16) {
-                    _mm256_storeu_si256((__m256i *) (row + t), _mm256_setzero_si256());
-                    _mm256_storeu_si256((__m256i *) (row + t + 8), _mm256_setzero_si256());
-                }
-
                 // interior: both taps in range, 8 t at a time
                 const int64_t tlo = std::max<int64_t>(0, odd_tail ? -off_a : std::max(-off_a, -off_b));
                 const int64_t thi = std::min<int64_t>(OL, odd_tail ? (T - off_a) : std::min(T - off_a, T - off_b));
+
+                // zero only the parts the interior loop will not write. Zeroing the whole row first and
+                // then overwriting the middle doubled the write traffic of im2col, which the phase
+                // timing put at 17% of the dec stage.
+                for (int64_t t = 0; t < tlo; t += 8) {
+                    _mm256_storeu_si256((__m256i *) (row + t), _mm256_setzero_si256());
+                }
+                for (int64_t t = thi; t < OLp; t += 8) {
+                    _mm256_storeu_si256((__m256i *) (row + t), _mm256_setzero_si256());
+                }
                 int64_t t = tlo;
                 for (; t + 8 <= thi; t += 8) {
                     const __m256 va = xform(_mm256_loadu_ps(xa + t + off_a));
@@ -180,13 +215,7 @@ bool gsv_conv_direct_1d_bf16(const gsv_conv_bf16_args & args) {
         const int64_t tb0  = std::min<int64_t>(ith * pert, n_tb);
         const int64_t tb1  = std::min<int64_t>(tb0 + pert, n_tb);
 
-        auto store_block = [&](const __m512 & a0, const __m512 & a1, const __m512 & a2,
-                               const __m512 & a3, const __m512 & a4, const __m512 & a5,
-                               int64_t ocb, int64_t tstart, int64_t tn) {
-            alignas(64) float tmp[TBZ][16];
-            _mm512_store_ps(tmp[0], a0); _mm512_store_ps(tmp[1], a1);
-            _mm512_store_ps(tmp[2], a2); _mm512_store_ps(tmp[3], a3);
-            _mm512_store_ps(tmp[4], a4); _mm512_store_ps(tmp[5], a5);
+        auto store_block = [&](const float tmp[TBZ][16], int64_t ocb, int64_t tstart, int64_t tn) {
             for (int64_t j = 0; j < 16; ++j) {
                 const int64_t oc = ocb + j;
                 if (oc >= OC) break;
@@ -202,71 +231,100 @@ bool gsv_conv_direct_1d_bf16(const gsv_conv_bf16_args & args) {
             }
         };
 
-        // 12 taps x 16 oc: twelve independent accumulators give a 12-cycle reuse distance against a
-        // ~4-6 cycle vdpbf16ps latency, so the single dp port stays busy. With 6 taps the reuse
-        // distance equalled the latency and the port idled (measured IPC 2.08 against 2.96 for f32).
-        // Loop order matters more than the micro-kernel here: with oc outer, every oc block re-reads
-        // the whole im2col buffer from DRAM (KPP*OLp*4 bytes, i.e. K times the activation, once per
-        // block - 371 MB for the largest dec layer against 67 MB for the f32 kernel which needs no
-        // im2col at all). With the t block outer, one 12*KPP*4 = 34 KB Xb tile stays in L1 and it is
-        // the 360 KB weight tile that streams, from L2 instead of DRAM.
+        // 8 taps x 32 oc per pass.
+        // The bottleneck is the size of the Xb activation tile, NT * KPP * 4 bytes: for the largest dec
+        // layer KPP = 128*11/2 = 704, so 12 taps is 33.8 KB - past the 32 KB L1 - and every t block
+        // re-fetches it from L2 (perf put 60% of the samples on the vpbroadcastd loads that hit it).
+        // 8 taps is 22.0 KB.
+        // One batch of 8 broadcasts feeds 16 dpbf16ps, so the activation reads per MAC are
+        // amortized over 2 oc blocks as well.
+        // Register budget: 16 accumulators + 2 weights + 1 broadcast = 19 of 32 zmm.
+        extern unsigned long long g_dec_fma;
+        g_dec_fma += (unsigned long long) ((OCp / 32) * KPP * (tb1 - tb0) * 16);
+        { const unsigned long long _gt3 = __rdtsc(); gsv_dec_acc(1, _gt3 - _gt2); }
+        gsv_dec_kernel_scope _gks(__rdtsc());
         for (int64_t tb = tb0; tb < tb1; ++tb) {
             const int64_t tstart = tb * TBZ;
-            for (int64_t oc0 = 0; oc0 < OCp; oc0 += 16) {
-                __m512 a0 = _mm512_setzero_ps();
-                __m512 a1 = _mm512_setzero_ps();
-                __m512 a2 = _mm512_setzero_ps();
-                __m512 a3 = _mm512_setzero_ps();
-                __m512 a4 = _mm512_setzero_ps();
-                __m512 a5 = _mm512_setzero_ps();
-                __m512 a6 = _mm512_setzero_ps();
-                __m512 a7 = _mm512_setzero_ps();
-                __m512 a8 = _mm512_setzero_ps();
-                __m512 a9 = _mm512_setzero_ps();
-                __m512 a10 = _mm512_setzero_ps();
-                __m512 a11 = _mm512_setzero_ps();
+            const int64_t tn = std::min<int64_t>(TBZ, OL - tstart);
+            for (int64_t oc0 = 0; oc0 < OCp; oc0 += 32) {
+                const bool has1 = oc0 + 16 < OCp;
+                __m512 v0_0 = _mm512_setzero_ps();
+                __m512 v0_1 = _mm512_setzero_ps();
+                __m512 v0_2 = _mm512_setzero_ps();
+                __m512 v0_3 = _mm512_setzero_ps();
+                __m512 v0_4 = _mm512_setzero_ps();
+                __m512 v0_5 = _mm512_setzero_ps();
+                __m512 v0_6 = _mm512_setzero_ps();
+                __m512 v0_7 = _mm512_setzero_ps();
+                __m512 v1_0 = _mm512_setzero_ps();
+                __m512 v1_1 = _mm512_setzero_ps();
+                __m512 v1_2 = _mm512_setzero_ps();
+                __m512 v1_3 = _mm512_setzero_ps();
+                __m512 v1_4 = _mm512_setzero_ps();
+                __m512 v1_5 = _mm512_setzero_ps();
+                __m512 v1_6 = _mm512_setzero_ps();
+                __m512 v1_7 = _mm512_setzero_ps();
                 for (int64_t kp2 = 0; kp2 < KPP; ++kp2) {
-                    const __m512bh wv0 = m512bh(_mm512_loadu_si512((const void *) (Wb + kp2 * OCp + oc0)));
+                    const uint32_t * wp = Wb + kp2 * OCp + oc0;
                     const uint32_t * xp = Xb + kp2 * OLp + tstart;
-                    a0 = _mm512_dpbf16_ps(a0, m512bh(_mm512_set1_epi32((int) xp[0])), wv0);
-                    a1 = _mm512_dpbf16_ps(a1, m512bh(_mm512_set1_epi32((int) xp[1])), wv0);
-                    a2 = _mm512_dpbf16_ps(a2, m512bh(_mm512_set1_epi32((int) xp[2])), wv0);
-                    a3 = _mm512_dpbf16_ps(a3, m512bh(_mm512_set1_epi32((int) xp[3])), wv0);
-                    a4 = _mm512_dpbf16_ps(a4, m512bh(_mm512_set1_epi32((int) xp[4])), wv0);
-                    a5 = _mm512_dpbf16_ps(a5, m512bh(_mm512_set1_epi32((int) xp[5])), wv0);
-                    a6 = _mm512_dpbf16_ps(a6, m512bh(_mm512_set1_epi32((int) xp[6])), wv0);
-                    a7 = _mm512_dpbf16_ps(a7, m512bh(_mm512_set1_epi32((int) xp[7])), wv0);
-                    a8 = _mm512_dpbf16_ps(a8, m512bh(_mm512_set1_epi32((int) xp[8])), wv0);
-                    a9 = _mm512_dpbf16_ps(a9, m512bh(_mm512_set1_epi32((int) xp[9])), wv0);
-                    a10 = _mm512_dpbf16_ps(a10, m512bh(_mm512_set1_epi32((int) xp[10])), wv0);
-                    a11 = _mm512_dpbf16_ps(a11, m512bh(_mm512_set1_epi32((int) xp[11])), wv0);
-                }
-                alignas(64) float tmp[TBZ][16];
-                _mm512_store_ps(tmp[0], a0);
-                _mm512_store_ps(tmp[1], a1);
-                _mm512_store_ps(tmp[2], a2);
-                _mm512_store_ps(tmp[3], a3);
-                _mm512_store_ps(tmp[4], a4);
-                _mm512_store_ps(tmp[5], a5);
-                _mm512_store_ps(tmp[6], a6);
-                _mm512_store_ps(tmp[7], a7);
-                _mm512_store_ps(tmp[8], a8);
-                _mm512_store_ps(tmp[9], a9);
-                _mm512_store_ps(tmp[10], a10);
-                _mm512_store_ps(tmp[11], a11);
-                const int64_t tn = std::min<int64_t>(TBZ, OL - tstart);
-                for (int64_t j = 0; j < 16; ++j) {
-                    const int64_t oc = oc0 + j;
-                    if (oc >= OC) break;
-                    const float bv = bp[oc];
-                    float * orow = o_data + oc * OL + tstart;
-                    for (int64_t i = 0; i < tn; ++i) {
-                        float v = bv + tmp[i][j];
-                        if (has_res) v = v + r_data[oc * OL + tstart + i];
-                        if (has_act) v = slope < 0.f ? tanhf(v)
-                                          : (v > 0.f ? v : 0.f) + slope * (v < 0.f ? v : 0.f);
-                        orow[i] = v;
+                    __m512bh xb;
+                    const __m512bh w0 = m512bh(_mm512_loadu_si512((const void *) (wp)));
+                    const __m512bh w1 = has1
+                        ? m512bh(_mm512_loadu_si512((const void *) (wp + 16)))
+                        : w0;
+                    if (kp2 + 4 < KPP) {
+                        const uint32_t * xa = Xb + (kp2 + 4) * OLp + tstart;
+                        _mm_prefetch((const char *) xa,          _MM_HINT_T0);
+                        _mm_prefetch((const char *) (xa + 8),    _MM_HINT_T0);
+                        _mm_prefetch((const char *) (xa + 16),   _MM_HINT_T0);
+                        _mm_prefetch((const char *) (xa + 24),   _MM_HINT_T0);
                     }
+                    xb = m512bh(_mm512_set1_epi32((int) xp[0]));
+                    v0_0 = _mm512_dpbf16_ps(v0_0, xb, w0);
+                    v1_0 = _mm512_dpbf16_ps(v1_0, xb, w1);
+                    xb = m512bh(_mm512_set1_epi32((int) xp[1]));
+                    v0_1 = _mm512_dpbf16_ps(v0_1, xb, w0);
+                    v1_1 = _mm512_dpbf16_ps(v1_1, xb, w1);
+                    xb = m512bh(_mm512_set1_epi32((int) xp[2]));
+                    v0_2 = _mm512_dpbf16_ps(v0_2, xb, w0);
+                    v1_2 = _mm512_dpbf16_ps(v1_2, xb, w1);
+                    xb = m512bh(_mm512_set1_epi32((int) xp[3]));
+                    v0_3 = _mm512_dpbf16_ps(v0_3, xb, w0);
+                    v1_3 = _mm512_dpbf16_ps(v1_3, xb, w1);
+                    xb = m512bh(_mm512_set1_epi32((int) xp[4]));
+                    v0_4 = _mm512_dpbf16_ps(v0_4, xb, w0);
+                    v1_4 = _mm512_dpbf16_ps(v1_4, xb, w1);
+                    xb = m512bh(_mm512_set1_epi32((int) xp[5]));
+                    v0_5 = _mm512_dpbf16_ps(v0_5, xb, w0);
+                    v1_5 = _mm512_dpbf16_ps(v1_5, xb, w1);
+                    xb = m512bh(_mm512_set1_epi32((int) xp[6]));
+                    v0_6 = _mm512_dpbf16_ps(v0_6, xb, w0);
+                    v1_6 = _mm512_dpbf16_ps(v1_6, xb, w1);
+                    xb = m512bh(_mm512_set1_epi32((int) xp[7]));
+                    v0_7 = _mm512_dpbf16_ps(v0_7, xb, w0);
+                    v1_7 = _mm512_dpbf16_ps(v1_7, xb, w1);
+                }
+                alignas(64) float t0[TBZ][16];
+                _mm512_store_ps(t0[0], v0_0);
+                _mm512_store_ps(t0[1], v0_1);
+                _mm512_store_ps(t0[2], v0_2);
+                _mm512_store_ps(t0[3], v0_3);
+                _mm512_store_ps(t0[4], v0_4);
+                _mm512_store_ps(t0[5], v0_5);
+                _mm512_store_ps(t0[6], v0_6);
+                _mm512_store_ps(t0[7], v0_7);
+                store_block(t0, oc0, tstart, tn);
+                if (has1) {
+                    alignas(64) float t1[TBZ][16];
+                _mm512_store_ps(t1[0], v1_0);
+                _mm512_store_ps(t1[1], v1_1);
+                _mm512_store_ps(t1[2], v1_2);
+                _mm512_store_ps(t1[3], v1_3);
+                _mm512_store_ps(t1[4], v1_4);
+                _mm512_store_ps(t1[5], v1_5);
+                _mm512_store_ps(t1[6], v1_6);
+                _mm512_store_ps(t1[7], v1_7);
+                    store_block(t1, oc0 + 16, tstart, tn);
                 }
             }
         }
