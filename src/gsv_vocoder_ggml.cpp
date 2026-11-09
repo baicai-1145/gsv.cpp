@@ -186,6 +186,33 @@ gsv_vocoder_ggml * gsv_vocoder_ggml::load(const std::string & gguf_path, const g
             s.w[tname] = tt;
         }
         fclose(fp);
+
+        // GSV_BF16_CONV=1: 把卷积权重原地转成 bf16, 让 ggml 的 conv 走 vdpbf16ps 内核
+        // (两个 bf16 操作数, fp32 累加, 32 MAC/指令 vs f32 内核的 8)。bf16 只占一半字节,
+        // 原来的 f32 缓冲区装得下, 所以不需要重新分配: 正向遍历时写指针永远落后读指针。
+        // 只转 3D 的卷积权重 [K,IC,OC]; bias 是 1D, 其它张量不碰。数值上 dec 全程
+        // cos 0.999917 -> 0.999769 (fp32 累加, 只有输入被舍入)。
+        const bool bf16_conv = getenv("GSV_BF16_CONV") && atoi(getenv("GSV_BF16_CONV")) != 0;
+        int n_bf16 = 0;
+        if (bf16_conv && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            for (auto & kv : s.w) {
+                ggml_tensor * t = kv.second;
+                if (!t || t->type != GGML_TYPE_F32) continue;
+                if (t->ne[2] <= 1 || t->ne[3] != 1) continue;        // 只要 conv 权重
+                if (kv.first.size() < 7 || kv.first.compare(kv.first.size() - 7, 7, ".weight") != 0) continue;
+                float * src = (float *) t->data;
+                ggml_bf16_t * dst = (ggml_bf16_t *) t->data;
+                const int64_t n = t->ne[0] * t->ne[1] * t->ne[2];
+                for (int64_t i = 0; i < n; i++) dst[i] = ggml_fp32_to_bf16(src[i]);
+                t->type = GGML_TYPE_BF16;
+                t->nb[0] = sizeof(ggml_bf16_t);
+                t->nb[1] = t->nb[0] * t->ne[0];
+                t->nb[2] = t->nb[1] * t->ne[1];
+                t->nb[3] = t->nb[2] * t->ne[2];
+                n_bf16++;
+            }
+            fprintf(stderr, "[gsv_voc_ggml] bf16 conv weights: %d tensors converted in place\n", n_bf16);
+        }
     }
 
     {
