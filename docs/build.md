@@ -353,16 +353,32 @@ first batch experiment look useless):
 
 | quantity | value |
 |---|---|
-| decode, B=1 | **6.71 ms/step** (150 MB of q8 weights / 6.7 ms = 22 GB/s, i.e. weight-bandwidth bound) |
+| decode, B=1 | **6.71 ms/step** = 21 GMAC/s (compute bound, see the B scan below) |
 | prefill | **~3.0 ms per position** for S ~ 250 |
 | decode, B=8 | 46.7 ms/step -> 2.1x aggregate, i.e. batching buys almost nothing |
 | prefill, B=8 | 7.6x of B=1 - also nearly linear |
 | AVX-512 build vs AVX2 | decode **1.9x slower** (12.71 vs 6.71 ms/step) - keep the AVX2 build |
 | prefill hotspot (perf) | 67% `tinyBLAS_Q0_AVX<q8_0,q8_0,float>::gemm4xN`, 21% `flash_attn_ext` |
 
-Why batching does not help: batching amortises the *weight* pass, but the rest of the step is attention
-over each sequence's own KV, which is per-sequence and therefore linear in B. At B=8 the weight pass is
-~9 ms while 8 sequences' attention is ~32 ms, so the total stays ~40 ms/step no matter what.
+Why batching does not help: **decode is compute bound**, not weight-bandwidth bound. The B scan settles
+it - throughput is flat at 20.7 GMAC/s (B=1) and 25.1 GMAC/s (B=8), so every extra sequence costs a full
+share of MACs:
+
+| B | per-step | GMAC/s |
+|---|---|---|
+| 1 | 6.8 ms | 20.7 |
+| 4 | 24.3 ms | 23.2 |
+| 8 | 45.2 ms | 25.1 |
+
+At B=1 the two hypotheses are numerically indistinguishable (q8 weighs exactly one byte per weight, so
+"150 MB of weights / 6.8 ms" and "141 M MAC / 6.8 ms" both give ~22), which is exactly why only the B scan
+can separate them. Prefill already runs at ~47 GMAC/s (3.0 ms per position), i.e. near the practical
+ceiling of the non-VNNI q8 dot (vpmaddubsw + vpmaddwd).
+
+This also disposes of `GSV_MM_ROW_OUTER`: swapping the block loops in
+`ggml_compute_forward_mul_mat_one_chunk` so a 16-row weight block stays resident is bit-identical
+(verified by comparing the sampled token stream md5), but it changes nothing measurable - B=1 6.89 ->
+6.79 ms, B=4 24.32 -> 24.09, B=8 45.21 -> 45.37 - because the weights were never being re-read.
 
 The real cost for long text is the **per-segment fixed price**. `split_text` (non-streaming) used to cut
 every **8 characters**, so a 240-character sentence became ~30 segments, and every segment paid its own
@@ -376,8 +392,6 @@ copy the KV into every sequence slot (8 seqs x 103 positions x 48 KiB = 39 MB, c
 segment prefill only its own target. That turns the per-segment `O(Pp^2)` attention into
 `t * (Pp + t)`.
 
-Also recorded: `GSV_MM_ROW_OUTER` (swapping the block loops in
-`ggml_compute_forward_mul_mat_one_chunk` so a 16-row weight block stays in L1 while every column of the
-batch walks it) is bit-identical - verified by comparing the sampled token stream md5 across the two
-modes - but the win it can deliver is bounded by the weight share of the step, which the numbers above
-put at roughly a quarter at B=8.
+Also tested and rejected on this CPU: `GGML_AVX_VNNI=ON` builds fine (149 `vpdpbusd` in the library) but
+dies with SIGILL - this EPYC exposes `avx512_vnni` (EVEX) and not `avx_vnni` (VEX). `GGML_AVX512=ON` is
+1.9x slower for the AR decode (12.71 vs 6.71 ms/step), the same verdict as for the vocoder convolutions.
