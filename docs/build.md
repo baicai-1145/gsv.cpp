@@ -278,16 +278,26 @@ axis, im2col materialised as bf16 pairs in `[kp2][t]` layout (8 taps per iterati
 the simulation's cos to 6 digits (0.999769), so the arithmetic is right. Micro-benchmark of bb16 vs
 f32 GEMV on the same box: 31.0 vs 18.9 GMAC/s (1.67x in cache).
 
-The clock-independent comparison (one binary, one thread, back-to-back, same 2.25 GHz after the
-burstable budget ran out - wall clock is useless here, cycles are not):
+The clock-independent comparison that settles it: one binary, one thread, nothing else running,
+two interleaved pairs (the host had dropped to 2.25 GHz, so wall clock is worthless here; cycles are
+not). perf stat, whole run:
 
-| config | instructions | cycles | IPC | cos |
-|---|---|---|---|---|
-| f32 conv | 130.02 G | 62.56 G | 2.08 | 0.999917 |
-| bf16 conv | 92.43 G | 53.04 G | 1.74 | 0.999769 |
+| run | instructions | cycles | IPC |
+|---|---|---|---|
+| f32  pair 1 | 129.68 G | 43.638 G | 2.97 |
+| bf16 pair 1 |  92.16 G | 44.388 G | 2.08 |
+| f32  pair 2 | 129.69 G | 43.954 G | 2.95 |
+| bf16 pair 2 |  92.16 G | 44.429 G | 2.07 |
 
-29% fewer instructions but only 15% fewer cycles, because IPC drops 2.08 -> 1.74: the bf16 kernel is
-denser in memory stalls. Net gain on the dec stage is ~1.2x, not the 2x the arithmetic promised.
+**28.9% fewer instructions, 1.4% MORE cycles.** IPC collapses 2.96 -> 2.08, so the instruction saving
+is entirely given back by stalls and the bf16 path ends up marginally slower. That is the verdict: the
+bf16 arithmetic advantage is real (31.0 vs 18.9 GMAC/s in the isolated GEMV) but this convolution is
+not arithmetic-bound - it is bound by one `vdpbf16ps` per cycle on a single execution port plus six
+broadcast loads per reduction step, which the f32 kernel hides behind a 3-wide issue mix.
+
+An earlier pair of runs showed 1.18x in favour of bf16; that measurement was taken while a second
+synth process was competing for the same core, which is exactly the kind of contamination the
+interleaved protocol is supposed to catch.
 
 Raw wall-clock numbers, same binary, 2 threads, at the 3.07 GHz the box still had at that point:
 
