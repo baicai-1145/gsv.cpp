@@ -370,10 +370,24 @@ share of MACs:
 | 4 | 24.3 ms | 23.2 |
 | 8 | 45.2 ms | 25.1 |
 
-At B=1 the two hypotheses are numerically indistinguishable (q8 weighs exactly one byte per weight, so
-"150 MB of weights / 6.8 ms" and "141 M MAC / 6.8 ms" both give ~22), which is exactly why only the B scan
-can separate them. Prefill already runs at ~47 GMAC/s (3.0 ms per position), i.e. near the practical
-ceiling of the non-VNNI q8 dot (vpmaddubsw + vpmaddwd).
+At B=1 the two hypotheses are numerically indistinguishable (a q8 weight is one byte and one MAC, so
+"85 MB / 6.8 ms" and "77 M MAC / 6.8 ms" both give ~12 per millisecond), which is why only the B scan can
+separate them. The model is 88,669,856 bytes, i.e. ~77 M params, not the 150 MB assumed earlier.
+
+The decisive check turned out to be SMT scaling, not the B scan alone: one thread gives 6.99 ms/step and
+two give 6.71 ms/step, i.e. **1.04x**. Extra SMT threads add issue capacity and latency hiding but no
+memory bandwidth, so 1.04x rules out a latency-bound kernel and leaves a single shared execution unit.
+
+Instruction budget for the non-VNNI q8 GEMV: per 32-weight block it needs one 32 B load, vpmaddubsw,
+vpmaddwd, vpaddd and the amortised scale (cvt + fmadd), i.e. ~6 instructions per 32 MAC = 4.7 MAC per
+instruction. At 2.25 GHz that is 12.7 GMAC/s at IPC 1.2 and 15.9 at IPC 1.5, and the measured 11.3 (B=1)
+to 13.6 (B=8) GMAC/s sits at 85-90% of that. So the AR decode is instruction-issue bound and essentially
+saturated - there is no 4x sitting in the loop nest, which is also why reordering the block loops cannot
+help.
+
+The only way past it is fewer instructions per MAC, i.e. a wider dot: VNNI (`vpdpbusd`, 64 MAC/instr)
+needs the VEX form this EPYC lacks (AVX-512 VNNI exists but that build is 1.9x slower here), and
+`vdpbf16ps` (32 MAC/instr) would force 16-bit weights - which is what the vocoder now does.
 
 This also disposes of `GSV_MM_ROW_OUTER`: swapping the block loops in
 `ggml_compute_forward_mul_mat_one_chunk` so a 16-row weight block stays resident is bit-identical
